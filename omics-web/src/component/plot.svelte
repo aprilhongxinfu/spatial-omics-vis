@@ -168,6 +168,27 @@
                         );
                     });
 
+                    setTimeout(() => {
+                        document
+                            .querySelectorAll(".selectionlayer path")
+                            .forEach((el) => {
+                                el.setAttribute(
+                                    "style",
+                                    el
+                                        .getAttribute("style")
+                                        ?.replace(
+                                            /pointer-events:\s*[^;]+;?/g,
+                                            "",
+                                        )
+                                        ?.replace(/cursor:\s*[^;]+;?/g, "") ??
+                                        "",
+                                );
+
+                                el.style.pointerEvents = "none";
+                                el.style.cursor = "default";
+                            });
+                    }, 0);
+                    
                     dispatch("spotClick", {
                         info: barcodes,
                         lassoSelected: lassoSelected,
@@ -441,3 +462,13 @@
 </script>
 
 <div class="h-full" bind:this={spatialDiv}></div>
+
+<style global>
+    .selectionlayer path {
+        pointer-events: none !important;
+        cursor: default !important;
+    }
+    /* .outline-controllers {
+        pointer-events: none !important;
+    } */
+</style>
