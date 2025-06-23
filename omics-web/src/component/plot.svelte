@@ -24,6 +24,77 @@
     let prevSelectedBarcodes = [];
     let plotInstance = null;
     let previewUrl = "";
+    let annotationVisible = false;
+    let annotationText = "";
+    let annotationPos = {};
+    let annotationColor = "";
+    let previewBox, previewImg, previewOverlay, previewCircle;
+    let lastSX = 0,
+        lastSY = 0,
+        lastSW = 0,
+        lastSH = 0;
+
+    function updatePreviewCircle(p) {
+        if (
+            !previewImg ||
+            !previewCircle ||
+            !image ||
+            !plotInstance ||
+            !previewUrl
+        )
+            return;
+
+        tick().then(() => {
+            const displayWidth = previewImg.clientWidth;
+            const displayHeight = previewImg.clientHeight;
+
+            const imageObj = plotInstance.layout.images?.[0];
+            if (!imageObj) return;
+
+            // 原图大小
+            const imgW = image.width;
+            const imgH = image.height;
+
+            const sizex = imageObj.sizex ?? 1;
+            const sizey = imageObj.sizey ?? 1;
+            const x0Image = imageObj.x;
+            const y0Image = imageObj.y;
+
+            // 当前点在原图的像素坐标
+            const relX = (p.x - x0Image) * (imgW / sizex);
+            const relY = (p.y - y0Image) * (imgH / sizey);
+            const flippedY = imgH - relY;
+
+            // === 关键部分 ===
+            // 你需要记住上次框选区域的 sx, sy, sw, sh，才能做映射
+            const canvas = new Image();
+            canvas.src = previewUrl;
+
+            canvas.onload = () => {
+                // 拿到裁剪的尺寸
+                const sx = lastSX;
+                const sy = lastSY;
+                const sw = lastSW;
+                const sh = lastSH;
+
+                // 将原图上的点位置转换到裁剪图上的相对位置
+                const clippedX = (relX - sx) / sw;
+                const clippedY = (relY - sy) / sh;
+
+                // clamp 限制在 0-1 区间
+                const clampedX = Math.max(0, Math.min(1, clippedX));
+                const clampedY = Math.max(0, Math.min(1, clippedY));
+
+                const cx = clampedX * displayWidth;
+                const cy = clampedY * displayHeight;
+
+                previewOverlay.setAttribute("width", displayWidth);
+                previewOverlay.setAttribute("height", displayHeight);
+                previewCircle.setAttribute("cx", cx);
+                previewCircle.setAttribute("cy", cy);
+            };
+        });
+    }
 
     // 图像加载后才可绘制图层背景
     async function loadImage(url) {
@@ -200,34 +271,12 @@
                         const sy = (y0Sel - y0Image) * scaleY;
                         const sh = (y1Sel - y0Image) * scaleY - sy;
 
-                        // const yRange = plotInstance.layout.yaxis.range;
-                        // const yTopImage = Math.max(...yRange); // 修复核心点
+                        lastSX = sx;
+                        lastSY = sy;
+                        lastSW = sw;
+                        lastSH = sh;
+
                         const sizex = imageObj.sizex ?? 1;
-                        // const sizey = imageObj.sizey ?? 1;
-
-                        // const scaleX = image.width / sizex;
-                        // // const scaleY = image.height / sizey;
-
-                        // const y0Sel = Math.min(y0, y1);
-                        // const y1Sel = Math.max(y0, y1);
-                        // const x0Sel = Math.min(x0, x1);
-                        // const x1Sel = Math.max(x0, x1);
-
-                        // const yRange = plotInstance.layout.yaxis.range;
-                        // const yTopImage = Math.max(...yRange); // 图像顶部的逻辑 y 值
-                        // const yBottomImage = Math.min(...yRange); // 图像底部逻辑 y 值
-                        // const sizey = yTopImage - yBottomImage;
-                        // const scaleY = image.height / sizey;
-
-                        // const sx = (x0Sel - x0Image) * scaleX;
-                        // const sw = (x1Sel - x0Image) * scaleX - sx;
-
-                        // // 注意方向是图像从上到下
-                        // const sy = (y0Sel - yBottomImage) * scaleY;
-                        // const sh = (y1Sel - y0Sel) * scaleY;
-
-                        // console.log("xRange:", xRange);
-                        // console.log("yRange:", yRange);
                         console.log("eventData.range:", eventData.range);
                         console.log("canvas draw params:", { sx, sy, sw, sh });
                         console.log(
@@ -345,6 +394,7 @@
                         bgcolor: "white",
                         bordercolor: "",
                         borderwidth: 1,
+                        layer: "above",
                     },
                 ],
             });
@@ -391,6 +441,9 @@
                     dragmode: false,
                     annotations: [],
                 });
+                annotationVisible = false;
+                annotationText = "";
+                annotationPos = {};
 
                 const lassoPaths = document.querySelectorAll(
                     ".selectionlayer path",
@@ -594,12 +647,14 @@
                         arrowhead: 1,
                         ax: 0,
                         ay: -40,
-                        bgcolor: "white",
+                        bgcolor: clusterColorScale(lassoHover.newCluster),
                         bordercolor: "",
                         borderwidth: 1,
+                        layer: "above",
                     },
                 ],
             });
+            updatePreviewCircle(p);
         } else {
             Plotly.relayout(spatialDiv, {
                 annotations: [],
@@ -629,13 +684,30 @@
 
     {#if previewUrl}
         <div
-            class="absolute top-2 left-2 z-10 bg-white p-1 border border-gray-300 max-w-[300px] max-h-[300px] overflow-auto"
+            class="absolute top-2 left-2 z-10 bg-white p-1 border border-gray-300 max-w-[300px] max-h-[300px] overflow-hidden"
+            bind:this={previewBox}
         >
             <img
                 src={previewUrl}
                 alt="Preview"
-                class="max-w-full max-h-full object-contain"
+                class="max-w-full max-h-full object-contain block"
+                bind:this={previewImg}
             />
+
+            <svg
+                class="absolute top-0 left-0 pointer-events-none"
+                xmlns="http://www.w3.org/2000/svg"
+                style="width: 100%; height: 100%;"
+                bind:this={previewOverlay}
+            >
+                <circle
+                    r="6"
+                    fill="none"
+                    stroke="red"
+                    stroke-width="2"
+                    bind:this={previewCircle}
+                />
+            </svg>
         </div>
     {/if}
 </div>

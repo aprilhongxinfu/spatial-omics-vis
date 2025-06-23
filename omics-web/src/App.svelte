@@ -484,6 +484,7 @@
                             {clickedInfo}
                             {baseApi}
                             {currentSlice}
+                            {clusterColorScale}
                             on:acceptRecluster={(e) =>
                                 handleClusterUpdate(e.detail)}
                             on:lassoHover={(e) => {

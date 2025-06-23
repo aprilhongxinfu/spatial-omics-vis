@@ -7,6 +7,7 @@
     export let currentSlice;
     export let baseApi;
     export let clickedInfo;
+    export let clusterColorScale;
 
     const dispatch = createEventDispatcher();
     const methods = ["RF"];
@@ -164,7 +165,15 @@
                         <th>&nbsp;</th>
                     </tr>
                 </thead>
-                <tbody class="[&>tr]:hover:preset-tonal-primary">
+                <tbody
+                    class="[&>tr]:hover:preset-tonal-primary"
+                    on:mouseleave={() => {
+                        dispatch("lassoHover", {
+                            barcode: "",
+                            newCluster: "",
+                        });
+                    }}
+                >
                     {#each filteredResults as row, i}
                         <tr
                             class="cursor-pointer {row.changed
@@ -173,6 +182,10 @@
                             on:click={() => {
                                 expandedIndex = expandedIndex === i ? null : i;
                                 currentRow = row;
+                                dispatch("lassoHover", {
+                                    barcode: row.barcode,
+                                    newCluster: row.new_cluster,
+                                });
                             }}
                             on:mouseenter={() => {
                                 console.log("table", row);
@@ -181,16 +194,18 @@
                                     newCluster: row.new_cluster,
                                 });
                             }}
-                            on:mouseleave={() => {
-                                dispatch("lassoHover", {
-                                    barcode: "",
-                                    newCluster: "",
-                                });
-                            }}
                         >
                             <td>{row.barcode}</td>
-                            <td>{row.original_cluster}</td>
-                            <td>{row.new_cluster}</td>
+                            <td
+                                style="color:{clusterColorScale(
+                                    row.original_cluster,
+                                )}">{row.original_cluster}</td
+                            >
+                            <td
+                                style="color:{clusterColorScale(
+                                    row.new_cluster,
+                                )}">{row.new_cluster}</td
+                            >
                             <td class="text-right">
                                 {#if row.changed}
                                     <button
