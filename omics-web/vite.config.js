@@ -11,6 +11,15 @@ export default defineConfig({
     tailwindcss(),
     svelte()
   ],
+  server: {
+    proxy: {
+      '/api': {
+        target: 'http://localhost:3538',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api/, '')
+      }
+    }
+  },
   resolve: {
     alias: {
       '@img': path.resolve(__dirname, './img')

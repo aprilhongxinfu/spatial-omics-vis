@@ -1,21 +1,46 @@
 
-### 📦 安装依赖
+### Frontend setup (`omics-web`)
 
-确保你已安装 [Node.js](https://nodejs.org/)（推荐版本 ≥ 16）和 npm：
+This is the Svelte-based web frontend for the spatial omics viewer. It talks to
+the backend via the `/api` prefix (e.g. `/api/plot-data`, `/api/run-clustering`).
+
+### 1. Prerequisites
+
+Make sure you have a recent [Node.js](https://nodejs.org/) (recommended **≥ 16**)
+and npm installed:
 
 ```bash
 node -v
 npm -v
 ```
 
-### 然后在 omics-web 目录中运行：
+### 2. Install dependencies
+
+From the `omics-web/` directory:
+
 ```bash
 npm install
 ```
 
-### 🚀 启动开发服务器
+### 3. Run the dev server
+
+Still in `omics-web/`:
+
 ```bash
 npm run dev
 ```
 
-默认会在 http://localhost:5173 打开开发服务器。
+Or bind to all interfaces (useful when accessing from another machine):
+
+```bash
+npm run dev -- --host 0.0.0.0
+```
+
+By default Vite will start the dev server at:
+
+```text
+http://localhost:5173
+```
+
+Make sure the backend (`omics-backend`) is running on port `3538` so that the
+frontend can reach the API at `/api/*`.

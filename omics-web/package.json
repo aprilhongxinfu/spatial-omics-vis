@@ -23,6 +23,7 @@
     "bits-ui": "^1.5.3",
     "d3": "^7.9.0",
     "d3-lasso": "^0.0.5",
+    "marked": "^12.0.2",
     "plotly": "^1.0.6",
     "plotly.js-dist-min": "^3.0.1",
     "split.js": "^1.6.5",

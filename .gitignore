@@ -30,3 +30,39 @@ App_old.svelte
 cropper.svelte
 selectD3.svelte
 selectPlotly.svelte
+
+# omics-backend: ignore data contents, figures, notebooks, large artifacts
+omics-backend/data/*
+!omics-backend/data/.gitkeep
+omics-backend/figures/
+omics-backend/*.db
+omics-backend/*.ipynb
+omics-backend/*.npy
+omics-backend/*.zip
+omics-backend/*.png
+omics-backend/attention_flow_vectors_*.csv
+omics-backend/pkgs.txt
+omics-backend/whole_slice_attention_layer_5.csv
+omics-backend/SpatialConsensus_reclustering.py
+omics-web/src/component/sankeySortingDemo.svelte
+
+# omics-backend: ignore backend-unreferenced helper scripts / legacy code
+omics-backend/main_original.py
+omics-backend/main_GMM.py
+omics-backend/main copy.py
+omics-backend/Admixture_reclustering_v2_original.py
+omics-backend/Admixture_reclustering_v2 copy.py
+omics-backend/Admixture_reclustering_v2_newfeature.py
+omics-backend/export_demo_data.py
+omics-backend/export_downstream.py
+omics-backend/export_ai_analysis.py
+omics-backend/regenerate_plots.py
+omics-backend/test_admixture_integration.py
+omics-backend/clustering.py
+omics-backend/HVG_explain.py
+omics-backend/insert_img.py
+
+omics-demo/
+omics-web-old/
+result/
+deploy/
