@@ -511,9 +511,9 @@ let prevClickedInfo = clickedInfo;
         
         const base64 = toBase64(image);
         
-        // Use saved layout state if available (to preserve zoom/pan), otherwise use defaults
+        // 与后端一致：Plotly y 向上，图像底边在 y=0、顶边在 y=image.height，spots 已做 y 翻转
         const defaultXRange = [0, image.width];
-        const defaultYRange = [image.height, 0];
+        const defaultYRange = [0, image.height];
         
         const layout = {
             autosize: true,
@@ -543,7 +543,7 @@ let prevClickedInfo = clickedInfo;
                     sizey: image.height,
                     sizing: "contain",
                     xanchor: "left",
-                    yanchor: "top",
+                    yanchor: "bottom",
                     opacity: 0.6,
                     layer: "below",
                 },

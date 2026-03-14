@@ -137,6 +137,7 @@
     let loadingTimeoutId = null; // Timeout ID for fallback loading cancellation
     let clusterResultsList = [];
     let comparisonModeActive = true;
+    let prevComparisonModeActive = comparisonModeActive;
 
     // 子组件加载状态：聚类结果列表 & 比较视图
     let isClusterResultsLoading = false;
@@ -164,6 +165,21 @@
     const LEFT_PANEL_WIDTH = 360;
     const LEFT_PANEL_MIN_WIDTH = 280;
     const LEFT_PANEL_COLLAPSED_WIDTH = 48;
+
+    // Slice info 固定展示的 label 键（无数据时 value 留空，label 仍显示）
+    const SLICE_INFO_LABEL_KEYS = ["spot_count", "gene_count", "avg_genes_per_spot"];
+    $: sliceInfoDisplayEntries = (() => {
+        const details = spatialInfo?.info_details ?? {};
+        const extraKeys = Object.keys(details).filter(
+            (k) => !SLICE_INFO_LABEL_KEYS.includes(k) && k !== "expression"
+        );
+        const keys = [...SLICE_INFO_LABEL_KEYS, ...extraKeys];
+        return keys.map((key) => ({
+            key,
+            label: key.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()),
+            value: details[key] != null && details[key] !== "" ? details[key] : "",
+        }));
+    })();
 
     // Left sidebar collapsible sections
     // Initial state: show Slice info, collapse Cluster result
@@ -427,6 +443,17 @@
             currentSlice = allSlices[0];
         }
 
+        // 先让后端加载当前切片并创建 spot_cluster 表，否则 plot-data 会 404/空，spot 不显示
+        try {
+            const changeRes = await fetch(baseApi + `/changeSlice?sliceid=${currentSlice}`);
+            if (!changeRes.ok) {
+                const err = await changeRes.json().catch(() => ({}));
+                console.warn("changeSlice 未成功，plot 可能为空:", currentSlice, err.detail || changeRes.statusText);
+            }
+        } catch (e) {
+            console.warn("changeSlice 请求失败:", currentSlice, e);
+        }
+
         // 注意：不在函数内部设置 imageUrl，避免触发额外的状态更新
         // 改为返回 imageUrl，让调用者统一设置
         const newImageUrl = `${baseApi}/images/${currentSlice}/tissue_hires_image.png`;
@@ -437,19 +464,30 @@
 
         // await new Promise((resolve) => (image.onload = resolve));
 
-        // 预先获取 slice-info 以拿到默认 cluster_result_id
-        const infoRes = await fetch(
-            `${baseApi}/slice-info?slice_id=${currentSlice}`,
-        );
-        const sliceInfo = await infoRes.json();
+        // 预先获取 slice-info（新切片可能无 info.json，失败时用默认值，不阻断 spot-metrics 等）
+        let sliceInfo;
+        try {
+            const infoRes = await fetch(
+                `${baseApi}/slice-info?slice_id=${currentSlice}`,
+            );
+            sliceInfo = infoRes.ok ? await infoRes.json() : null;
+        } catch (_) {
+            sliceInfo = null;
+        }
+        if (!sliceInfo || typeof sliceInfo !== "object") {
+            sliceInfo = {
+                info_details: {},
+                cluster_result_id: "default",
+                cluster_method: "not_clustered",
+            };
+        }
 
         const targetClusterResultId =
             currentClusterResult?.cluster_result_id ||
             sliceInfo.cluster_result_id ||
             "default";
 
-        // 用当前切片 ID 获取 plot-data 及相关统计，确保带上聚类结果 ID
-        // 注意：不在这里加载下游分析的数据（DEG、cellchat等），这些数据会在下游分析模块中按需加载
+        // 用当前切片 ID 获取 plot-data 及相关统计；任一项失败也不影响其他（如 spot-metrics 用于小提琴图）
         const [plotRes, ncountRes, metricsRes, logRes] = await Promise.all([
             fetch(
                 `${baseApi}/plot-data?slice_id=${currentSlice}&cluster_result_id=${targetClusterResultId}`,
@@ -461,10 +499,18 @@
             fetch(`${baseApi}/cluster-log?slice_id=${currentSlice}&cluster_result_id=${targetClusterResultId}`),
         ]);
 
-        const plotData = await plotRes.json();
-        const ncountData = await ncountRes.json();
-        const metricsData = await metricsRes.json();
-        const logData = await logRes.json();
+        const plotData = plotRes.ok && plotRes.headers.get("content-type")?.includes("json")
+            ? await plotRes.json()
+            : [];
+        const ncountData = ncountRes.ok && ncountRes.headers.get("content-type")?.includes("json")
+            ? await ncountRes.json()
+            : [];
+        const metricsData = metricsRes.ok && metricsRes.headers.get("content-type")?.includes("json")
+            ? await metricsRes.json()
+            : [];
+        const logData = logRes.ok && logRes.headers.get("content-type")?.includes("json")
+            ? await logRes.json()
+            : [];
 
         if (
             !comparisonModeActive &&
@@ -1080,6 +1126,8 @@
         // 现在清空数据，此时 loading 已经是 true，条件判断不会触发额外的加载状态
         spatialData = [];
         imageUrl = "";
+        spatialInfo = null;
+        spotMetricsData = null;
 
         try {
             const {
@@ -1092,8 +1140,9 @@
                 logData,
             } = await fetchSpatial();
 
+            const plotList = Array.isArray(plotData) ? plotData : [];
             const fallbackClusters = Array.from(
-                new Set((plotData || []).map((trace) => `${trace.name}`)),
+                new Set(plotList.map((trace) => `${trace.name}`)),
             ).sort((a, b) => {
                 const numA = parseFloat(a);
                 const numB = parseFloat(b);
@@ -1133,22 +1182,23 @@
             // 批量更新状态，避免多次触发重新渲染
             image = loadedImage;
             imageUrl = newImageUrl;  // 使用返回的 imageUrl
-            spatialData = plotData;
+            spatialData = plotList;
             spatialData.sort((a, b) => {
                 const numA = parseFloat(a.name);
                 const numB = parseFloat(b.name);
                 return numA - numB;
             });
             console.log("spatialData", spatialData);
-            spatialInfo = sliceInfo;
+            // 始终保留 sliceInfo（含空 info_details），便于页面显示 label、value 可空
+            spatialInfo = sliceInfo ?? null;
             currentMethod = sliceInfo.cluster_method || currentMethod;
             if (!prevSlice && sliceInfo?.cluster_method) {
                 uiClusteringMethod = sliceInfo.cluster_method;
             }
             epoch = sliceInfo.epoch ?? 500;
             n_clusters = sliceInfo.n_clusters ?? 7;
-            ncountSpatialData = ncountData;
-            spotMetricsData = metricsData;
+            ncountSpatialData = Array.isArray(ncountData) ? ncountData : [];
+            spotMetricsData = Array.isArray(metricsData) ? metricsData : [];
 
             allLog = logData;
             clusterGeneExpression = null;
@@ -1196,7 +1246,7 @@
         loading = true;
         isLoadingClusterResult = true;
         spatialData = [];
-        image = null;
+        // 不清空 image/imageUrl，否则空间预览底图会消失，只更新 overlay (spatialData)
         ncountSpatialData = null;
         spotMetricsData = null;
         allLog = null;
@@ -1839,15 +1889,19 @@
         });
     });
 
-    // Ensure cluster results are loaded once when entering comparison mode with empty list
-    $: if (
-        comparisonModeActive &&
-        clusterManagementRef &&
-        typeof clusterManagementRef.refreshResults === "function" &&
-        (!clusterResultsList || clusterResultsList.length === 0) &&
-        !isClusterResultsLoading
-    ) {
-        clusterManagementRef.refreshResults({ autoSelectFirst: false });
+    // Ensure cluster results are loaded once when *entering* comparison mode with empty list (not every time list stays empty)
+    $: {
+        const justEnteredComparison = comparisonModeActive && !prevComparisonModeActive;
+        prevComparisonModeActive = comparisonModeActive;
+        if (
+            justEnteredComparison &&
+            clusterManagementRef &&
+            typeof clusterManagementRef.refreshResults === "function" &&
+            (!clusterResultsList || clusterResultsList.length === 0) &&
+            !isClusterResultsLoading
+        ) {
+            clusterManagementRef.refreshResults({ autoSelectFirst: false });
+        }
     }
 
     // Clean up and re-initialize split when comparisonModeActive changes
@@ -1898,24 +1952,38 @@
 
     $: if (currentSlice !== prevSlice) {
         (async () => {
-            // 先设置 loading 状态，确保加载状态立即显示
             if (prevSlice !== undefined) {
                 loading = true;
-                await tick(); // 确保 loading 状态先更新
-            }
-            
-            if (prevSlice) {
-                await fetch(
-                    baseApi + `/changeSlice?sliceid=${currentSlice}`,
-                );
+                await tick();
             }
 
-            console.log(currentSlice);
-            // refreshSpatialState 内部也会设置 loading，但由于已经设置了，不会触发额外的加载状态
-            if (prevSlice !== undefined) {
-                await refreshSpatialState();
+            try {
+                if (prevSlice) {
+                    const changeRes = await fetch(
+                        baseApi + `/changeSlice?sliceid=${currentSlice}`,
+                    );
+                    if (!changeRes.ok) {
+                        const errBody = await changeRes.json().catch(() => ({}));
+                        const msg = errBody.detail || changeRes.statusText || "切换切片失败";
+                        console.warn("切换切片失败:", currentSlice, msg);
+                        currentSlice = prevSlice;
+                        prevSlice = currentSlice;
+                        loading = false;
+                        alert(msg);
+                        return;
+                    }
+                }
+
+                if (prevSlice !== undefined) {
+                    await refreshSpatialState();
+                }
+            } catch (err) {
+                console.warn("切换切片加载失败:", currentSlice, err);
+                currentSlice = prevSlice ?? currentSlice;
+                loading = false;
+            } finally {
+                prevSlice = currentSlice;
             }
-            prevSlice = currentSlice;
         })();
     }
 </script>
@@ -2010,27 +2078,23 @@
                                     </span>
                                 </button>
                                 {#if isSliceSectionOpen}
-                                    <!-- Spatial Info -->
-                                    {#if spatialInfo}
-                                        <div
-                                            class="pt-1 border-t border-dashed border-stone-300 text-gray-600"
-                                        >
-                                            {#each Object.entries(spatialInfo.info_details) as [key, value]}
-                                                {#if key !== "expression"}
-                                                    <div
-                                                        class="flex justify-between text-xs py-0"
-                                                    >
-                                                        <span class="capitalize"
-                                                            >{key}:</span
-                                                        >
-                                                        <span class="text-gray-800"
-                                                            >{value}</span
-                                                        >
-                                                    </div>
-                                                {/if}
-                                            {/each}
-                                        </div>
-                                    {/if}
+                                    <!-- Spatial Info：始终显示 label，无数据时 value 留空 -->
+                                    <div
+                                        class="pt-1 border-t border-dashed border-stone-300 text-gray-600"
+                                    >
+                                        {#each sliceInfoDisplayEntries as { key, label, value }}
+                                            <div
+                                                class="flex justify-between text-xs py-0"
+                                            >
+                                                <span class="capitalize"
+                                                    >{label}:</span
+                                                >
+                                                <span class="text-gray-800"
+                                                    >{value}</span
+                                                >
+                                            </div>
+                                        {/each}
+                                    </div>
 
                                     {#if spotMetricsData && spotMetricsData.length}
                                         <div

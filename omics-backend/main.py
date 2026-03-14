@@ -1,4 +1,7 @@
 import os
+import subprocess
+import sys
+import tempfile
 import time
 os.environ["NUMBA_THREADING_LAYER"] = "tbb"  # Thread-safe alternative
 print("NUMBA_THREADING_LAYER:", os.environ.get("NUMBA_THREADING_LAYER"))
@@ -519,7 +522,10 @@ expression_data = None
 
 @app.get("/images/{slice_id}/tissue_hires_image.png")
 def get_image(slice_id: str):
-    path = f"./data/{slice_id}/spatial/tissue_hires_image.png"
+    spatial_dir = f"./data/{slice_id}/spatial"
+    path = os.path.join(spatial_dir, "tissue_hires_image.png")
+    if not os.path.exists(path):
+        path = os.path.join(spatial_dir, "tissue_lowres_image.png")
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Image not found")
     return FileResponse(path, media_type="image/png")
@@ -533,6 +539,87 @@ def get_cluster_plot(slice_id: str, plot_filename: str):
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Plot image not found")
     return FileResponse(path, media_type="image/png")
+
+
+def _set_mito_ribo_genes(adata):
+    """
+    为 adata.var 设置 mt/ribo 标记，支持多种基因命名（人/鼠/其它常见格式），
+    避免因命名不匹配导致 percent_mito/percent_ribo 全为 0。
+    若矩阵中本身无核糖体/线粒体基因（如已过滤或为子集），对应比例会为 0 属正常。
+    """
+    names = adata.var_names.astype(str).str.strip()
+    # 线粒体：人 MT-、鼠 mt-/Mt-、以及 MT. / MTRNR / MTND / MTCO / MTATP 等
+    mt = (
+        names.str.startswith("MT-")
+        | names.str.startswith("mt-")
+        | names.str.startswith("Mt-")
+        | names.str.startswith("MT.")
+        | names.str.match(r"^MT[A-Z0-9]", case=False, na=False)
+    )
+    adata.var["mt"] = mt
+    # 核糖体：RPS/RPL（人）、Rps/Rpl（鼠）、全小写 rps/rpl、线粒体核糖体 MRPS/MRPL/Mrps/Mrpl，
+    # 以及 ^RP 后跟 S/L 的任意变体（含数字后缀如 RPS1、Rpl7a）
+    ribo = (
+        names.str.startswith(("RPS", "RPL", "Rps", "Rpl", "rps", "rpl"))
+        | names.str.startswith(("MRPS", "MRPL", "Mrps", "Mrpl", "mrps", "mrpl"))
+        | names.str.match(r"^RP[SL]\w*", case=False, na=False)
+        | names.str.match(r"^Rp[sl]\w*", na=False)
+    )
+    adata.var["ribo"] = ribo
+
+
+def _load_visium_from_matrix_csv(base_path: str):
+    """
+    当 filtered_feature_bc_matrix.h5 不存在时，从 matrix_counts.csv 与 tissue_positions 构建 AnnData。
+    - matrix_counts.csv: 第一列为基因名，表头为 barcode（spots），值为 counts；可在 base_path/spatial/ 或 base_path/ 下。
+    - tissue_positions_list.csv: 无表头，列为 barcode, in_tissue, array_row, array_col, x, y；位于 base_path/spatial/。
+    """
+    base_path = os.path.normpath(base_path)
+    spatial_dir = os.path.join(base_path, "spatial")
+
+    # 查找 matrix_counts.csv（优先 spatial 下）
+    matrix_path = os.path.join(spatial_dir, "matrix_counts.csv")
+    if not os.path.isfile(matrix_path):
+        matrix_path = os.path.join(base_path, "matrix_counts.csv")
+    if not os.path.isfile(matrix_path):
+        raise FileNotFoundError(f"matrix_counts.csv 不存在于 {spatial_dir} 或 {base_path}")
+
+    # 读取表达矩阵：CSV 为 genes x spots，AnnData 需要 obs x var，故转置
+    print(f"📂 从 CSV 加载表达矩阵: {matrix_path}")
+    counts_df = pd.read_csv(matrix_path, index_col=0)
+    if counts_df.shape[0] == 0 or counts_df.shape[1] == 0:
+        raise ValueError("matrix_counts.csv 为空或格式不正确")
+    # counts_df: index = genes, columns = barcodes
+    counts_df = counts_df.T
+    counts_df.index = counts_df.index.astype(str).str.strip('"')
+    barcodes = counts_df.index.tolist()
+    genes = counts_df.columns.tolist()
+
+    # 读取空间坐标
+    tp_path = os.path.join(spatial_dir, "tissue_positions_list.csv")
+    if not os.path.isfile(tp_path):
+        raise FileNotFoundError(f"tissue_positions_list.csv 不存在于 {spatial_dir}")
+    tp = pd.read_csv(tp_path, header=None)
+    if tp.shape[1] < 6:
+        raise ValueError("tissue_positions_list.csv 至少需要 6 列 (barcode, in_tissue, array_row, array_col, x, y)")
+    # 10x 2.0: 第5列=pxl_row=y，第6列=pxl_col=x（与官方文档一致）
+    tp.columns = ["barcode", "in_tissue", "array_row", "array_col", "col5", "col6"][: tp.shape[1]]
+    tp["barcode"] = tp["barcode"].astype(str).str.strip('"')
+    tp = tp.set_index("barcode")
+
+    spatial_xy = np.zeros((len(barcodes), 2), dtype=np.float64)
+    for i, bc in enumerate(barcodes):
+        if bc in tp.index:
+            spatial_xy[i, 0] = tp.loc[bc, "col6"]   # x = pxl_col
+            spatial_xy[i, 1] = tp.loc[bc, "col5"]   # y = pxl_row
+        else:
+            spatial_xy[i] = np.nan
+
+    X = np.asarray(counts_df.values, dtype=np.float32)
+    adata_local = sc.AnnData(X=X, obs=pd.DataFrame(index=barcodes), var=pd.DataFrame(index=genes))
+    adata_local.obsm["spatial"] = spatial_xy
+    print(f"📦 从 matrix_counts.csv 加载完成, shape: {adata_local.shape}")
+    return adata_local
 
 
 def prepare_data(force_reload=False):
@@ -551,8 +638,20 @@ def prepare_data(force_reload=False):
 
         create_tables(slice_id)
 
-        adata_local = sq.read.visium(path=path)
-        print(f"📦 Visium 数据加载完成, shape: {adata_local.shape}")
+        h5_path = os.path.join(path, "filtered_feature_bc_matrix.h5")
+        matrix_csv_path = os.path.join(path, "spatial", "matrix_counts.csv")
+        if not os.path.isfile(matrix_csv_path):
+            matrix_csv_path = os.path.join(path, "matrix_counts.csv")
+
+        if os.path.isfile(h5_path):
+            adata_local = sq.read.visium(path=path)
+            print(f"📦 Visium 数据加载完成 (h5), shape: {adata_local.shape}")
+        elif os.path.isfile(matrix_csv_path):
+            adata_local = _load_visium_from_matrix_csv(path)
+        else:
+            raise FileNotFoundError(
+                "未找到 filtered_feature_bc_matrix.h5 或 matrix_counts.csv，请准备该切片的 Visium 数据"
+            )
 
         if not adata_local.var_names.is_unique:
             print("⚠️ 检测到重复基因名，正在修复")
@@ -565,17 +664,7 @@ def prepare_data(force_reload=False):
             (adata_local.X > 0).sum(1).A1 if hasattr(adata_local.X, "A1") else (adata_local.X > 0).sum(1)
         )
 
-        # Support both human (MT-) and mouse (mt-, Mt-) mitochondrial gene naming
-        adata_local.var["mt"] = (
-            adata_local.var_names.str.startswith("MT-") |
-            adata_local.var_names.str.startswith("mt-") |
-            adata_local.var_names.str.startswith("Mt-")
-        )
-        # Support both human and mouse ribosomal gene naming (RPS, RPL, Rps, Rpl)
-        adata_local.var["ribo"] = (
-            adata_local.var_names.str.startswith(("RPS", "RPL")) |
-            adata_local.var_names.str.startswith(("Rps", "Rpl"))
-        )
+        _set_mito_ribo_genes(adata_local)
         sc.pp.calculate_qc_metrics(adata_local, qc_vars=["mt", "ribo"], inplace=True)
 
         if not (adata_local.X.min() >= 0 and adata_local.X.max() <= 20):
@@ -597,6 +686,15 @@ def prepare_data(force_reload=False):
                 metadata.reflect(bind=engine)
                 spot_cluster = metadata.tables[table_name]
 
+                # 安全转换：None/NaN -> 0，保证新切片的小提琴图后两项（percent_mito/percent_ribo）有值
+                def _safe_float(v):
+                    if v is None or (isinstance(v, float) and np.isnan(v)):
+                        return 0.0
+                    try:
+                        return float(v)
+                    except (TypeError, ValueError):
+                        return 0.0
+
                 records = []
                 for i, (barcode, row) in enumerate(adata_local.obs.iterrows()):
                     x, y = map(float, adata_local.obsm["spatial"][i])
@@ -606,10 +704,10 @@ def prepare_data(force_reload=False):
                         "cluster": "unknown",
                         "x": x,
                         "y": y,
-                        "n_count_spatial": float(row.get("nCount_Spatial", None)),
-                        "n_feature_spatial": float(row.get("nFeature_Spatial", None)),
-                        "percent_mito": float(row.get("pct_counts_mt", None)),
-                        "percent_ribo": float(row.get("pct_counts_ribo", None)),
+                        "n_count_spatial": _safe_float(row.get("nCount_Spatial")),
+                        "n_feature_spatial": _safe_float(row.get("nFeature_Spatial")),
+                        "percent_mito": _safe_float(row.get("pct_counts_mt")),
+                        "percent_ribo": _safe_float(row.get("pct_counts_ribo")),
                         "emb": "",
                     })
 
@@ -648,19 +746,7 @@ def prepare_data(force_reload=False):
             if need_update_metrics:
                 # 确保已经计算了QC指标（在prepare_data的前面已经计算过）
                 if "pct_counts_mt" not in adata_local.obs.columns or "pct_counts_ribo" not in adata_local.obs.columns:
-                    if "mt" not in adata_local.var.columns:
-                        # Support both human (MT-) and mouse (mt-, Mt-) mitochondrial gene naming
-                        adata_local.var["mt"] = (
-                            adata_local.var_names.str.startswith("MT-") |
-                            adata_local.var_names.str.startswith("mt-") |
-                            adata_local.var_names.str.startswith("Mt-")
-                        )
-                    if "ribo" not in adata_local.var.columns:
-                        # Support both human and mouse ribosomal gene naming
-                        adata_local.var["ribo"] = (
-                            adata_local.var_names.str.startswith(("RPS", "RPL")) |
-                            adata_local.var_names.str.startswith(("Rps", "Rpl"))
-                        )
+                    _set_mito_ribo_genes(adata_local)
                     sc.pp.calculate_qc_metrics(adata_local, qc_vars=["mt", "ribo"], inplace=True)
                 
                 # 更新数据库中的指标
@@ -1310,6 +1396,36 @@ def store_per_cluster_metrics(cluster_metrics: List[dict], slice_id: str, cluste
         traceback.print_exc()
 
 
+def _compute_umap_in_subprocess(emb: np.ndarray, barcodes, timeout: int = 600) -> np.ndarray:
+    """
+    在子进程中计算 UMAP（NUMBA_THREADING_LAYER=workqueue），避免 TBB 在非主线程 fork 卡死。
+    返回 X_umap shape (n_obs, 2)。数据量大时约 30 秒–2 分钟属正常。
+    """
+    n_obs = emb.shape[0]
+    print(f"🔄 UMAP 计算中（spot 数={n_obs}，约 30 秒–2 分钟，请勿关闭）...", flush=True)
+    worker_dir = os.path.dirname(os.path.abspath(__file__))
+    worker_script = os.path.join(worker_dir, "umap_worker.py")
+    env = os.environ.copy()
+    env["NUMBA_THREADING_LAYER"] = "workqueue"
+    with tempfile.TemporaryDirectory(prefix="umap_") as tmpdir:
+        in_npz = os.path.join(tmpdir, "in.npz")
+        out_npz = os.path.join(tmpdir, "out.npz")
+        np.savez(in_npz, emb=emb.astype(np.float64), barcodes=np.array(barcodes))
+        proc = subprocess.run(
+            [sys.executable, worker_script, in_npz, out_npz],
+            env=env,
+            cwd=worker_dir,
+            timeout=timeout,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"UMAP 子进程失败 (exit {proc.returncode})，请查看上方日志")
+        out_data = np.load(out_npz, allow_pickle=True)
+        X_umap = out_data["X_umap"]
+        out_data.close()
+    print("✅ UMAP 计算完成", flush=True)
+    return X_umap
+
+
 def compute_and_store_umap(adata_obj, slice_id: str, cluster_result_id: str) -> None:
     """
     根据当前聚类结果计算 UMAP，并将坐标写入数据库，供前端后续直接使用。
@@ -1326,14 +1442,9 @@ def compute_and_store_umap(adata_obj, slice_id: str, cluster_result_id: str) -> 
 
     if "X_umap" not in adata_local.obsm:
         print("🔄 正在为新聚类结果计算 UMAP ...")
-        adata_temp = adata_local.copy()
-        if not (adata_temp.X.min() >= 0 and adata_temp.X.max() <= 20):
-            sc.pp.normalize_total(adata_temp)
-            sc.pp.log1p(adata_temp)
-        sc.pp.neighbors(adata_temp, use_rep="emb", n_neighbors=15, n_pcs=None)
-        sc.tl.umap(adata_temp, min_dist=0.5, spread=1.0)
-        adata_local.obsm["X_umap"] = adata_temp.obsm["X_umap"]
-        adata_local.uns["neighbors"] = adata_temp.uns.get("neighbors", {})
+        emb = adata_local.obsm["emb"]
+        barcodes = adata_local.obs_names.tolist()
+        adata_local.obsm["X_umap"] = _compute_umap_in_subprocess(emb, barcodes)
 
     adata.obsm["X_umap"] = adata_local.obsm["X_umap"]
     adata.uns["neighbors"] = adata_local.uns.get("neighbors", {})
@@ -1848,6 +1959,43 @@ def get_all_slice_ids(data_root="./data"):
     return folders
 
 
+class ClearSliceDataRequest(BaseModel):
+    slice_ids: List[str]
+
+
+def _safe_slice_id(sid: str) -> bool:
+    """只允许字母数字、点、下划线、横线，防止 SQL 注入。"""
+    return bool(sid) and all(c.isalnum() or c in "._-" for c in sid)
+
+
+@app.post("/admin/clear-slice-data")
+def clear_slice_data(request: ClearSliceDataRequest):
+    """
+    清空指定切片的数据库数据，便于重新加载（如修正坐标后重来）。
+    会删除：spot_cluster_{slice_id} 全表数据、cluster_method / cluster_log 中该 slice 的记录。
+    清空后切换到该切片会触发 prepare_data 重新从 CSV 插入 default 数据。
+    """
+    slice_ids = [s.strip() for s in request.slice_ids if s and _safe_slice_id(s.strip())]
+    if not slice_ids:
+        raise HTTPException(status_code=400, detail="请提供有效的 slice_ids（如 ['slice1', 'slice1.4']）")
+    with engine.begin() as conn:
+        for sid in slice_ids:
+            table_name = f"spot_cluster_{sid}"
+            quoted = f'"{table_name}"'
+            try:
+                conn.execute(text(f"DELETE FROM {quoted}"))
+            except Exception as e:
+                if "no such table" in str(e).lower():
+                    pass
+                else:
+                    raise
+        for sid in slice_ids:
+            conn.execute(text("DELETE FROM cluster_method WHERE slice_id = :sid"), {"sid": sid})
+        for sid in slice_ids:
+            conn.execute(text("DELETE FROM cluster_log WHERE slice_id = :sid"), {"sid": sid})
+    return {"ok": True, "slice_ids": slice_ids, "message": "已清空，请切换到对应切片以重新加载数据"}
+
+
 @app.on_event("startup")
 def load_once():
     global slice_id,spatial_dir,sf,scale_key,factor,path
@@ -1861,13 +2009,45 @@ def load_once():
     print("目前加载的是切片:",slice_id)
     prepare_data()
 
-def get_scalefactor(slice_id: str) -> float:
+def _which_tissue_image(slice_id: str) -> str | None:
+    """与 get_image 一致：返回实际使用的图片名（hires 优先，否则 lowres）。"""
+    spatial_dir = Path(f"data/{slice_id}/spatial")
+    if (spatial_dir / "tissue_hires_image.png").exists():
+        return "tissue_hires_image.png"
+    if (spatial_dir / "tissue_lowres_image.png").exists():
+        return "tissue_lowres_image.png"
+    return None
+
+
+def get_scalefactor(slice_id: str, use_hires: bool | None = None) -> float:
+    """缩放因子需与前端显示的图一致：有 hires 用 hires 因子，只有 lowres 用 lowres 因子。
+    支持 10x 标准 key（*scalefactor）与简写（*scalef）。"""
     path = Path(f"data/{slice_id}/spatial/scalefactors_json.json")
-    if path.exists():
-        with open(path) as f:
-            scalefactors = json.load(f)
-        return scalefactors.get("tissue_hires_scalef", 1.0)
-    return 1.0
+    if not path.exists():
+        return 1.0
+    with open(path) as f:
+        sf = json.load(f)
+    if use_hires is None:
+        use_hires = _which_tissue_image(slice_id) == "tissue_hires_image.png"
+    if use_hires:
+        return sf.get("tissue_hires_scalefactor") or sf.get("tissue_hires_scalef", 1.0)
+    return sf.get("tissue_lowres_scalefactor") or sf.get("tissue_lowres_scalef", 1.0)
+
+
+def _get_tissue_image_size(slice_id: str) -> tuple[float, float] | None:
+    """返回 (width, height)，与前端显示的 tissue 图一致（hires 优先，否则 lowres）。"""
+    spatial_dir = Path(f"data/{slice_id}/spatial")
+    for name in ("tissue_hires_image.png", "tissue_lowres_image.png"):
+        path = spatial_dir / name
+        if path.exists():
+            try:
+                img = plt.imread(str(path))
+                if hasattr(img, "shape") and len(img.shape) >= 2:
+                    h, w = img.shape[:2]
+                    return float(w), float(h)
+            except Exception as e:
+                print(f"⚠️ 读取图片尺寸失败 {path}: {e}")
+    return None
 
 def save_cluster_plot(slice_id: str, cluster_result_id: str) -> str:
     """
@@ -1904,9 +2084,19 @@ def save_cluster_plot(slice_id: str, cluster_result_id: str) -> str:
             print("⚠️ 数据为空，跳过 plot 生成")
             return None
         
-        # 应用缩放因子
+        # 应用缩放因子（与 get_plot_data 一致）
         df["x"] = df["x"] * factor
         df["y"] = df["y"] * factor
+        img_size = _get_tissue_image_size(slice_id)
+        if img_size is not None:
+            img_w, img_h = img_size
+            x_range = df["x"].max() - df["x"].min()
+            y_range = df["y"].max() - df["y"].min()
+            fit_xy = abs(x_range - img_w) + abs(y_range - img_h)
+            fit_yx = abs(x_range - img_h) + abs(y_range - img_w)
+            if fit_yx < fit_xy:
+                df["x"], df["y"] = df["y"].copy(), df["x"].copy()
+            df["y"] = img_h - df["y"]
         
         # 生成 plot，保持与前端一致的比例与样式
         x_min, x_max = df["x"].min(), df["x"].max()
@@ -1965,9 +2155,9 @@ def save_cluster_plot(slice_id: str, cluster_result_id: str) -> str:
                 edgecolors="none"
             )
 
-        # 设置坐标范围和比例，移除多余装饰
+        # 设置坐标范围和比例（数据已做 y 翻转，此处用正常 y 轴方向）
         ax.set_xlim(x_min, x_max)
-        ax.set_ylim(y_max, y_min)  # 翻转 y 轴以匹配前端显示
+        ax.set_ylim(y_min, y_max)
         ax.set_aspect("equal", adjustable="box")
         ax.axis("off")
         fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
@@ -2038,9 +2228,22 @@ def get_plot_data(slice_id: str = Query(...), cluster_result_id: str = "default"
             print(f"⚠️ 数据清理后为空 (slice_id={slice_id}, cluster_result_id={cluster_result_id})")
             return []
 
-        # 应用缩放因子
+        # 应用缩放因子（与当前实际使用的 tissue 图一致：hires 或 lowres）
         df["x"] = df["x"] * factor
         df["y"] = df["y"] * factor
+
+        img_size = _get_tissue_image_size(slice_id)
+        if img_size is not None:
+            img_w, img_h = img_size
+            # 若 tissue_positions 为 10x 2.0 顺序 (row,col) 但被存成 (x,y)，缩放后宽高会与图反
+            x_range = df["x"].max() - df["x"].min()
+            y_range = df["y"].max() - df["y"].min()
+            fit_xy = abs(x_range - img_w) + abs(y_range - img_h)
+            fit_yx = abs(x_range - img_h) + abs(y_range - img_w)
+            if fit_yx < fit_xy:
+                df["x"], df["y"] = df["y"].copy(), df["x"].copy()
+            # Visium 坐标 y 向下，Plotly y 向上；翻转 y 使点与底图对齐
+            df["y"] = img_h - df["y"]
 
         # 构造 Plotly traces
         traces = []
@@ -2314,16 +2517,44 @@ def get_attention_flow_radial(
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=error_msg)
 
+def _slice_data_ready(sid: str) -> tuple[bool, str]:
+    """检查切片目录是否包含 Visium 所需文件（h5 或 matrix_counts.csv），返回 (是否就绪, 错误说明)。"""
+    base = os.path.join("./data", sid)
+    if not os.path.isdir(base):
+        return False, "切片目录不存在"
+    h5_path = os.path.join(base, "filtered_feature_bc_matrix.h5")
+    matrix_csv = os.path.join(base, "spatial", "matrix_counts.csv")
+    if not os.path.isfile(matrix_csv):
+        matrix_csv = os.path.join(base, "matrix_counts.csv")
+    if not os.path.isfile(h5_path) and not os.path.isfile(matrix_csv):
+        return False, "切片数据不完整，缺少 filtered_feature_bc_matrix.h5 或 matrix_counts.csv，请先准备该切片的 Visium 数据"
+    spatial_dir = os.path.join(base, "spatial")
+    sf_path = os.path.join(spatial_dir, "scalefactors_json.json")
+    if not os.path.isfile(sf_path):
+        return False, "切片数据不完整，缺少 spatial/scalefactors_json.json"
+    if not os.path.isfile(h5_path) and not os.path.isfile(os.path.join(spatial_dir, "tissue_positions_list.csv")):
+        return False, "使用 matrix_counts.csv 时需同时提供 spatial/tissue_positions_list.csv"
+    return True, ""
+
+
 @app.get("/changeSlice")
 def change_slice(sliceid: str = Query(...)):
     global slice_id, loaded_slice_id, factor
 
     print(f"🌀 请求切换切片为: {sliceid}")
+    prev_slice_id = slice_id
+    prev_loaded_slice_id = loaded_slice_id
+
+    ready, reason = _slice_data_ready(sliceid)
+    if not ready:
+        print(f"❌ 切换切片跳过 (slice_id={sliceid}): {reason}")
+        raise HTTPException(status_code=404, detail=reason)
+
     if sliceid == loaded_slice_id:
         print(f"⚠️ 当前切片已是 {sliceid}，仍执行强制刷新")
 
     slice_id = sliceid
-    loaded_slice_id = None  # ✨强制 prepare_data 重新加载
+    loaded_slice_id = None  # 强制 prepare_data 重新加载
 
     try:
         spatial_dir = os.path.join(f"./data/{slice_id}", "spatial")
@@ -2335,15 +2566,14 @@ def change_slice(sliceid: str = Query(...)):
 
         print(f"🔁 加载 scalefactor 为: {scale_key} = {factor}")
 
-        # 确保表已创建
         create_tables(slice_id)
-        
-        # 强制重新加载数据
         prepare_data(force_reload=True)
-        
+
         print(f"✅ 切片切换完成: {slice_id}")
         return {"status": "ok", "slice_id": slice_id}
     except Exception as e:
+        slice_id = prev_slice_id
+        loaded_slice_id = prev_loaded_slice_id
         error_msg = f"❌ 切换切片失败 (slice_id={sliceid}): {str(e)}"
         print(error_msg)
         import traceback
@@ -4022,28 +4252,7 @@ def get_spot_metrics(slice_id: str = Query(...), cluster_result_id: str = "defau
     for backward compatibility but ignored in the query.
     """
     table_name = f"spot_cluster_{slice_id}"
-    query = text(f"""
-        SELECT base.barcode,
-               base.cluster,
-               base.n_count_spatial   AS nCount_Spatial,
-               base.n_feature_spatial AS nFeature_Spatial,
-               base.percent_mito      AS percent_mito,
-               base.percent_ribo      AS percent_ribo
-        FROM `{table_name}` AS base
-        WHERE base.cluster_result_id = 'default'
-          AND (
-              base.n_count_spatial IS NOT NULL OR
-              base.n_feature_spatial IS NOT NULL OR
-              base.percent_mito IS NOT NULL OR
-              base.percent_ribo IS NOT NULL
-          )
-    """)
-
-    with engine.connect() as conn:
-        rows = conn.execute(query).fetchall()
-
     df = pd.DataFrame(
-        rows,
         columns=[
             "barcode",
             "cluster",
@@ -4053,40 +4262,93 @@ def get_spot_metrics(slice_id: str = Query(...), cluster_result_id: str = "defau
             "percent_ribo",
         ],
     )
+    try:
+        query = text(f"""
+            SELECT base.barcode,
+                   base.cluster,
+                   base.n_count_spatial   AS nCount_Spatial,
+                   base.n_feature_spatial AS nFeature_Spatial,
+                   base.percent_mito      AS percent_mito,
+                   base.percent_ribo      AS percent_ribo
+            FROM `{table_name}` AS base
+            WHERE base.cluster_result_id = 'default'
+              AND (
+                  base.n_count_spatial IS NOT NULL OR
+                  base.n_feature_spatial IS NOT NULL OR
+                  base.percent_mito IS NOT NULL OR
+                  base.percent_ribo IS NOT NULL
+              )
+        """)
+        with engine.connect() as conn:
+            rows = conn.execute(query).fetchall()
+        if rows:
+            df = pd.DataFrame(
+                rows,
+                columns=[
+                    "barcode",
+                    "cluster",
+                    "nCount_Spatial",
+                    "nFeature_Spatial",
+                    "percent_mito",
+                    "percent_ribo",
+                ],
+            )
+    except Exception as _e:
+        print(f"⚠️ spot-metrics 查询表失败 (slice_id={slice_id}): {_e}")
 
-    # If older databases have NULLs for some metrics, fall back to computing
-    # from the in‑memory AnnData to ensure all four violins render.
-    if df.empty or not (
-        df["nCount_Spatial"].notna().any()
-        and df["nFeature_Spatial"].notna().any()
-        and df["percent_mito"].notna().any()
-        and df["percent_ribo"].notna().any()
-    ):
-        # Ensure the global adata is loaded for this slice
+    def _build_fallback_df():
         global adata, loaded_slice_id
-        try:
-            if adata is None or loaded_slice_id != slice_id:
-                # Set the global slice_id and (re)load data without forcing reload if possible
-                globals()["slice_id"] = slice_id
-                prepare_data(force_reload=False)
+        if adata is None or loaded_slice_id != slice_id:
+            globals()["slice_id"] = slice_id
+            prepare_data(force_reload=False)
+        if adata is None:
+            return None
+        obs = adata.obs.copy()
+        idx = obs.index.astype(str)
+        pct_mt = obs.get("pct_counts_mt")
+        pct_ribo = obs.get("pct_counts_ribo")
+        if pct_mt is None:
+            pct_mt = pd.Series(0.0, index=obs.index)
+        else:
+            pct_mt = pct_mt.fillna(0.0)
+        if pct_ribo is None:
+            pct_ribo = pd.Series(0.0, index=obs.index)
+        else:
+            pct_ribo = pct_ribo.fillna(0.0)
+        ncount = obs.get("nCount_Spatial")
+        nfeat = obs.get("nFeature_Spatial")
+        if ncount is None:
+            ncount = pd.Series(0.0, index=obs.index)
+        if nfeat is None:
+            nfeat = pd.Series(0.0, index=obs.index)
+        return pd.DataFrame(
+            {
+                "barcode": idx,
+                "cluster": obs.get("domain", pd.Series("unknown", index=obs.index)).astype(str),
+                "nCount_Spatial": ncount,
+                "nFeature_Spatial": nfeat,
+                "percent_mito": pct_mt,
+                "percent_ribo": pct_ribo,
+            }
+        )
 
-            if adata is not None:
-                obs = adata.obs.copy()
-                # Build a simple DataFrame with per‑spot metrics; cluster is optional here
-                fallback_df = pd.DataFrame(
-                    {
-                        "barcode": obs.index.astype(str),
-                        "cluster": obs.get("domain", pd.Series(index=obs.index, dtype=str)),
-                        "nCount_Spatial": obs.get("nCount_Spatial"),
-                        "nFeature_Spatial": obs.get("nFeature_Spatial"),
-                        "percent_mito": obs.get("pct_counts_mt"),
-                        "percent_ribo": obs.get("pct_counts_ribo"),
-                    }
-                )
+    need_fallback = (
+        df.empty
+        or not df["nCount_Spatial"].notna().any()
+        or not df["nFeature_Spatial"].notna().any()
+        or not df["percent_mito"].notna().any()
+        or not df["percent_ribo"].notna().any()
+    )
+    if need_fallback:
+        try:
+            fallback_df = _build_fallback_df()
+            if fallback_df is not None:
                 df = fallback_df
         except Exception as _e:
-            # If fallback fails, keep the original (possibly sparse) df
-            pass
+            print(f"⚠️ spot-metrics fallback 失败 (slice_id={slice_id}): {_e}")
+        for col in ["nCount_Spatial", "nFeature_Spatial", "percent_mito", "percent_ribo"]:
+            if col not in df.columns or (df[col].isna().all() and len(df) > 0):
+                df[col] = 0.0
 
     # Convert to long format: one row per metric per spot, for faceted violins on frontend
     long_df = df.melt(
@@ -4095,6 +4357,8 @@ def get_spot_metrics(slice_id: str = Query(...), cluster_result_id: str = "defau
         var_name="metric",
         value_name="value",
     )
+    # 避免 NaN 导致前端小提琴图“无数据”，用 0 填充
+    long_df["value"] = long_df["value"].fillna(0.0)
 
     return long_df.to_dict(orient="records")
 
@@ -4907,21 +5171,22 @@ def get_umap_coordinates(slice_id: str = Query(...), cluster_result_id: str = "d
                 print(error_msg)
                 raise HTTPException(status_code=500, detail=error_msg)
 
-            # 构建邻接图并计算 UMAP（只计算一次）
+            # 在子进程中计算 UMAP，避免 Numba TBB 在非主线程 fork 卡死
             try:
-                sc.pp.neighbors(adata_local, use_rep="emb", n_neighbors=15, n_pcs=None)
-                # 使用更快的 UMAP 参数
-                sc.tl.umap(adata_local, min_dist=0.5, spread=1.0)
+                X_umap = _compute_umap_in_subprocess(
+                    adata_local.obsm["emb"],
+                    adata_local.obs_names.tolist(),
+                )
+                adata_local.obsm["X_umap"] = X_umap
             except Exception as e:
                 error_msg = f"❌ UMAP 计算失败: {str(e)}"
                 print(error_msg)
                 import traceback
                 print(traceback.format_exc())
                 raise HTTPException(status_code=500, detail=error_msg)
-            
+
             # 更新全局 adata
             adata.obsm["X_umap"] = adata_local.obsm["X_umap"]
-            adata.uns["neighbors"] = adata_local.uns.get("neighbors", {})
     except HTTPException:
         # 重新抛出 HTTPException
         raise

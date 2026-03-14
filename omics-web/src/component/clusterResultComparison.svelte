@@ -1481,6 +1481,7 @@
         }
 
         const base64 = toBase64(image);
+        // 与主 Plot 一致：Plotly y 向上，图像底边 y=0、顶边 y=image.height，spatialData 已由后端做 y 翻转
         const layout = {
             autosize: true,
             xaxis: {
@@ -1489,7 +1490,7 @@
             },
             yaxis: {
                 visible: false,
-                range: [image.height, 0], // y轴反向，与Plot组件一致
+                range: [0, image.height],
                 scaleanchor: "x",
                 scaleratio: 1,
             },
@@ -1515,7 +1516,7 @@
                     sizey: image.height,
                     sizing: "contain",
                     xanchor: "left",
-                    yanchor: "top",
+                    yanchor: "bottom",
                     opacity: 0.6,
                     layer: "below",
                 },
@@ -1838,16 +1839,9 @@
             // x: Plotly uses [0, imgW], canvas uses [offsetX, offsetX + imgW*scale]
             const pixelX = offsetX + plotlyX * scale;
             
-            // y: Plotly yaxis range is [imgH, 0] (reversed)
-            //    - Data y=0 (image top) is displayed at Plotly's bottom (yaxis position 0)
-            //    - Data y=imgH (image bottom) is displayed at Plotly's top (yaxis position imgH)
-            //    In canvas: y=0 is top, y=height is bottom
-            //    To match Plotly's visual position, we need to flip:
-            //    - plotlyY=0 (displayed at bottom) -> canvas bottom = offsetY + imgH*scale
-            //    - plotlyY=imgH (displayed at top) -> canvas top = offsetY
-            //    Formula: pixelY = offsetY + (imgH - plotlyY) * scale
-            //    This flips the y coordinate to match Plotly's reversed yaxis display
-            const pixelY = offsetY + ( plotlyY) * scale;
+            // Plotly 使用 y 向上：range [0, imgH]，plotlyY=0 在底部、plotlyY=imgH 在顶部
+            // Canvas：y=0 在顶部，故 pixelY = offsetY + (imgH - plotlyY) * scale
+            const pixelY = offsetY + (imgH - plotlyY) * scale;
             
             return { x: pixelX, y: pixelY };
         } catch (err) {

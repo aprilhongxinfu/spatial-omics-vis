@@ -103,6 +103,9 @@
     let imageErrors = new Set(); // Track which images failed to load
     let scrollContainer;
 
+    // 上次已加载 cluster-results 的 slice，避免同一 slice 被重复请求
+    let lastLoadedSlice = null;
+
     // 用于新聚类的参数
     let newMethod = currentMethod || "GraphST";
     let newNClusters = n_clusters || 7;
@@ -264,12 +267,12 @@
         });
     }
 
-    // Load cluster results when slice changes or after clustering
-    $: if (currentSlice) {
-        loadClusterResults();
-        // Reset selection and image errors when slice changes
+    // Load cluster results only when slice actually changes (avoid repeated calls for same slice)
+    $: if (currentSlice && currentSlice !== lastLoadedSlice) {
+        lastLoadedSlice = currentSlice;
         selectedResultId = null;
         imageErrors = new Set();
+        loadClusterResults();
     }
 
     // Expose a method to refresh results (can be called from parent if needed)

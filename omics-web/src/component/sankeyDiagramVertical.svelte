@@ -2274,7 +2274,7 @@
                         y1,
                     );
                     ctx.closePath();
-                    ctx.fillStyle = colorWithAlpha(bandColor, 0.55);
+                    ctx.fillStyle = colorWithAlpha(bandColor, 0.65);
                     ctx.fill();
                     // Subtle outline helps readability when ribbons overlap
                     // Line width scales with flow count: larger flows get thicker lines
@@ -2286,7 +2286,7 @@
                         0.3,
                         baseLineWidth * lineWidthScale,
                     );
-                    ctx.strokeStyle = colorWithAlpha(bandColor, 0.35);
+                    ctx.strokeStyle = colorWithAlpha(bandColor, 0.6);
                     ctx.stroke();
 
                     // Cache centerline for hit testing.
@@ -2437,11 +2437,12 @@
                             );
                             // If there's a highlight active, make non-highlighted lines gray
                             if (hasHighlight) {
-                                ctx.strokeStyle = "rgba(148, 163, 184, 0.2)"; // gray-400 with low opacity
+                                // Keep non-highlighted lines visible but de-emphasized
+                                ctx.strokeStyle = "rgba(148, 163, 184, 0.35)"; // gray-400 with medium-low opacity
                             } else {
                                 const flowColor = colorWithAlpha(
                                     from.color || to.color,
-                                    0.35,
+                                    0.6,
                                 );
                                 ctx.strokeStyle = flowColor;
                             }
