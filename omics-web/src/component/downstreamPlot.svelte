@@ -204,9 +204,11 @@
                 visible: false,
                 range: [0, image.width],
             },
+            // Use the same coordinate orientation as the demo:
+            // y 从 0 增加到 image.height，避免上下翻转
             yaxis: {
                 visible: false,
-                range: [image.height, 0],
+                range: [0, image.height],
                 scaleanchor: "x",
                 scaleratio: 1,
             },
@@ -220,7 +222,8 @@
                     xref: "x",
                     yref: "y",
                     x: 0,
-                    y: 0,
+                    // align image so that y=0 在底部，y 增大向上，与 demo 一致
+                    y: image.height,
                     sizex: image.width,
                     sizey: image.height,
                     sizing: "contain",
