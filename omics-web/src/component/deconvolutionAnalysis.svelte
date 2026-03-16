@@ -62,6 +62,10 @@
     // Color mapping: celltype name -> color index (to maintain stable colors)
     let cellTypeColorMap = new Map();
 
+    // 记录最初整个视野的坐标范围，用于根据缩放倍率调整饼图大小
+    let initialXRange = null;
+    let initialYRange = null;
+
     // Helper function to calculate total proportion for a coarse cell type
     function calculateCoarseTypeProportion(coarseNode, data) {
         let totalProportion = 0;
@@ -460,8 +464,13 @@
                 rect.height - (plotArea.t || 0) - (plotArea.b || 0);
 
             // Calculate scale factors
-            const xRangeSize = xRange[1] - xRange[0];
-            const yRangeSize = yRange[1] - yRange[0];
+            const xMin = Math.min(xRange[0], xRange[1]);
+            const xMax = Math.max(xRange[0], xRange[1]);
+            const yMin = Math.min(yRange[0], yRange[1]);
+            const yMax = Math.max(yRange[0], yRange[1]);
+
+            const xRangeSize = xMax - xMin;
+            const yRangeSize = yMax - yMin;
 
             if (xRangeSize === 0 || yRangeSize === 0) {
                 console.warn("Invalid axis range size:", { xRange, yRange });
@@ -470,12 +479,18 @@
 
             // Convert data coordinates to plot area coordinates
             const xInPlotArea =
-                ((plotlyX - xRange[0]) / xRangeSize) * plotAreaWidth;
-            const yInPlotArea =
-                ((plotlyY - yRange[0]) / yRangeSize) * plotAreaHeight;
+                ((plotlyX - xMin) / xRangeSize) * plotAreaWidth;
+
+            // y 轴在 layout 里是 [maxY, minY]（视觉上向下增大），这里根据 range 是否反转来决定是否翻转归一化坐标，
+            // 这样既保持当前图像方向不变，也能在缩放时正确计算像素位置。
+            let yNorm = (plotlyY - yMin) / yRangeSize;
+            if (yRange[0] > yRange[1]) {
+                // 反向轴：数据越大，屏幕越靠上，所以要翻转归一化值
+                yNorm = 1 - yNorm;
+            }
+            const yInPlotArea = yNorm * plotAreaHeight;
 
             // pixelX and pixelY are relative to the Plotly div's top-left corner.
-            // Since we now use a non-flipped y-axis (minY -> maxY), we should NOT flip here.
             const pixelX = plotLeft + xInPlotArea;
             const pixelY = plotTop + yInPlotArea;
 
@@ -665,6 +680,12 @@
         maxX += padding;
         minY -= padding;
         maxY += padding;
+
+        // 只在第一次渲染时记录“初始视野”的范围，用于估算缩放倍率
+        if (!initialXRange || !initialYRange) {
+            initialXRange = [minX, maxX];
+            initialYRange = [minY, maxY];
+        }
 
         // Build barcode to proportions map
         const barcodeToProportions = new Map();
@@ -945,7 +966,69 @@
         ctx.lineWidth = 0;
         ctx.strokeStyle = "transparent";
 
-        const radius = 3;
+        // ============ 动态半径：跟随缩放、同时控制重叠 ============
+        // 1）先根据 Plotly 当前的坐标范围 vs 初始范围计算一个缩放倍率
+        let zoomScale = 1;
+        if (plotDiv && plotDiv._fullLayout && initialXRange && initialYRange) {
+            const layout = plotDiv._fullLayout;
+            const xaxis = layout.xaxis;
+            const yaxis = layout.yaxis;
+            const xRange = xaxis?._rl || xaxis?.range;
+            const yRange = yaxis?._rl || yaxis?.range;
+            if (xRange && yRange) {
+                const curDx = Math.abs(xRange[1] - xRange[0]);
+                const curDy = Math.abs(yRange[1] - yRange[0]);
+                const initDx = Math.abs(initialXRange[1] - initialXRange[0]);
+                const initDy = Math.abs(initialYRange[1] - initialYRange[0]);
+                const curDiag = Math.hypot(curDx, curDy);
+                const initDiag = Math.hypot(initDx, initDy);
+                if (curDiag > 0 && initDiag > 0) {
+                    zoomScale = initDiag / curDiag; // 视野越小（放大越多），zoomScale 越大
+                }
+            }
+        }
+        // 避免极端值：缩放系数做一个截断
+        zoomScale = Math.max(0.5, Math.min(zoomScale, 20));
+
+        // 2）基于画布尺寸给一个基础半径，再乘以缩放倍率
+        const baseRadius = Math.max(2, Math.min(plotDivRect.width, plotDivRect.height) * 0.01);
+        let dynamicRadius = baseRadius * zoomScale;
+
+        // 3）用点间最小像素距离限制最大半径，减少严重重叠
+        const spotCoordsPixels = [];
+        const maxSamples = Math.min(spots.length, 400);
+        for (let i = 0; i < maxSamples; i++) {
+            const barcodeStr = String(spots[i]).trim();
+            const coords = barcodeToCoords.get(barcodeStr);
+            if (!coords) continue;
+            const pixelCoords = plotlyToPixelCoords(coords.x, coords.y, plotDiv);
+            if (!pixelCoords) continue;
+            spotCoordsPixels.push(pixelCoords);
+        }
+
+        let minDist = Infinity;
+        for (let i = 0; i < spotCoordsPixels.length; i++) {
+            const a = spotCoordsPixels[i];
+            for (let j = i + 1; j < spotCoordsPixels.length; j++) {
+                const b = spotCoordsPixels[j];
+                const dx = a.x - b.x;
+                const dy = a.y - b.y;
+                const d2 = dx * dx + dy * dy;
+                if (d2 === 0) continue;
+                if (d2 < minDist) {
+                    minDist = d2;
+                }
+            }
+        }
+
+        if (minDist !== Infinity) {
+            const minPixelDist = Math.sqrt(minDist);
+            const maxRadiusFromDist = minPixelDist * 0.45; // 小于一半，避免覆盖邻点
+            dynamicRadius = Math.min(dynamicRadius, maxRadiusFromDist);
+        }
+
+        // 最终半径再做一个合理截断，保证缩放时肉眼可见变化
+        const radius = Math.max(1.5, Math.min(dynamicRadius, 40));
         
         let drawnCount = 0;
         let missingCoordsCount = 0;
@@ -1052,10 +1135,6 @@
                         centerY,
                         canvasWidth: plotDivRect.width,
                         canvasHeight: plotDivRect.height,
-                        offsetX,
-                        offsetY,
-                        canvasRect: { left: canvasRect.left, top: canvasRect.top, width: canvasRect.width, height: canvasRect.height },
-                        plotDivRect: { left: plotDivRectForCoords.left, top: plotDivRectForCoords.top, width: plotDivRectForCoords.width, height: plotDivRectForCoords.height }
                     });
                 }
                 return;
