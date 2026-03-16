@@ -474,10 +474,10 @@
             const yInPlotArea =
                 ((plotlyY - yRange[0]) / yRangeSize) * plotAreaHeight;
 
-            // For reversed y-axis (yRange[0] > yRange[1]), we need to flip
-            // pixelX and pixelY are relative to the Plotly div's top-left corner
+            // pixelX and pixelY are relative to the Plotly div's top-left corner.
+            // Since we now use a non-flipped y-axis (minY -> maxY), we should NOT flip here.
             const pixelX = plotLeft + xInPlotArea;
-            const pixelY = plotTop + (plotAreaHeight - yInPlotArea); // Flip for reversed y-axis
+            const pixelY = plotTop + yInPlotArea;
 
             return { x: pixelX, y: pixelY };
         } catch (error) {

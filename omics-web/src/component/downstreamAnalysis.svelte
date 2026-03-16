@@ -2190,9 +2190,10 @@
                 visible: false,
                 range: [minX, maxX],
             },
+            // Use the same (non-flipped) spatial coordinate orientation as the preview plot
             yaxis: {
                 visible: false,
-                range: [maxY, minY], // y轴反向
+                range: [minY, maxY],
                 scaleanchor: "x",
                 scaleratio: 1,
             },
