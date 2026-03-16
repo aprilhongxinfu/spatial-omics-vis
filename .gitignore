@@ -7,7 +7,6 @@ __pycache__/
 .env
 .idea/
 VT3D.py
-cellchat.py
 151673/
 *_changed_details.csv
 *_prediction_details.csv
@@ -43,7 +42,6 @@ omics-backend/*.png
 omics-backend/attention_flow_vectors_*.csv
 omics-backend/pkgs.txt
 omics-backend/whole_slice_attention_layer_5.csv
-omics-backend/SpatialConsensus_reclustering.py
 omics-web/src/component/sankeySortingDemo.svelte
 
 # omics-backend: ignore backend-unreferenced helper scripts / legacy code
@@ -58,7 +56,6 @@ omics-backend/export_downstream.py
 omics-backend/export_ai_analysis.py
 omics-backend/regenerate_plots.py
 omics-backend/test_admixture_integration.py
-omics-backend/clustering.py
 omics-backend/HVG_explain.py
 omics-backend/insert_img.py
 
