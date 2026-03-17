@@ -997,9 +997,10 @@
 
     async function loadMetricsForResults() {
         if (!clusterResults?.length || !currentSlice) {
-            metricsData.clear();
+            metricsData = new Map();
             return;
         }
+        metricsData = new Map();
         
         // ⚡ 并行加载每个结果的 metrics
         await Promise.all(
@@ -1036,13 +1037,16 @@
             }
             }),
         );
+        // 触发 Svelte 响应式更新（Map 原地 set 不会触发子组件刷新）
+        metricsData = new Map(metricsData);
     }
     
     async function loadClusterMetricsForResults() {
         if (!clusterResults?.length || !currentSlice) {
-            clusterMetricsData.clear();
+            clusterMetricsData = new Map();
             return;
         }
+        clusterMetricsData = new Map();
         
         // ⚡ 并行加载每个结果的 cluster-level metrics
         await Promise.all(
@@ -1105,6 +1109,8 @@
             }
             }),
         );
+        // 触发 Svelte 响应式更新（Map 原地 set 不会触发子组件刷新）
+        clusterMetricsData = new Map(clusterMetricsData);
     }
     
     function drawMetricsCharts() {
@@ -1359,8 +1365,8 @@
     }
 
     function buildBarcodeClusterDistribution() {
-        barcodeClusterDistribution.clear();
-        barcodeStabilityPercent.clear();
+        const nextBarcodeClusterDistribution = new Map();
+        const nextBarcodeStabilityPercent = new Map();
         
         visibleDistributionSummary.forEach((summary) => {
             if (!summary.spots || !summary.clusters) return;
@@ -1377,11 +1383,11 @@
                 const cluster = String(spot.cluster).trim();
                 const color = clusterColorMap.get(cluster) || spot.color;
                 
-                if (!barcodeClusterDistribution.has(barcode)) {
-                    barcodeClusterDistribution.set(barcode, new Map());
+                if (!nextBarcodeClusterDistribution.has(barcode)) {
+                    nextBarcodeClusterDistribution.set(barcode, new Map());
                 }
                 
-                const clusterMap = barcodeClusterDistribution.get(barcode);
+                const clusterMap = nextBarcodeClusterDistribution.get(barcode);
                 if (!clusterMap.has(cluster)) {
                     clusterMap.set(cluster, { count: 0, color });
                 }
@@ -1391,17 +1397,21 @@
 
         // Compute stability percent for each barcode
         const totalResults = visibleDistributionSummary.length || 0;
-        barcodeClusterDistribution.forEach((clusterMap, barcode) => {
+        nextBarcodeClusterDistribution.forEach((clusterMap, barcode) => {
             if (!totalResults) {
-                barcodeStabilityPercent.set(barcode, 0);
+                nextBarcodeStabilityPercent.set(barcode, 0);
                 return;
             }
             let maxCount = 0;
             clusterMap.forEach((entry) => {
                 if (entry?.count > maxCount) maxCount = entry.count;
             });
-            barcodeStabilityPercent.set(barcode, (maxCount / totalResults) * 100);
+            nextBarcodeStabilityPercent.set(barcode, (maxCount / totalResults) * 100);
         });
+
+        // Re-assign new Map objects to trigger Svelte reactivity in child components.
+        barcodeClusterDistribution = nextBarcodeClusterDistribution;
+        barcodeStabilityPercent = nextBarcodeStabilityPercent;
     }
 
     $: if (visibleDistributionSummary?.length) {
@@ -2234,8 +2244,11 @@
     }
     
     // Rebuild barcode cluster distribution when visibleDistributionSummary changes
-    $: if (visibleDistributionSummary?.length > 0) {
-        buildBarcodeClusterDistribution();
+    $: {
+        // Always rebuild when summaries change so stability filter tracks latest results set.
+        if (Array.isArray(visibleDistributionSummary)) {
+            buildBarcodeClusterDistribution();
+        }
     }
     
     // Redraw pie chart when canvas size changes or barcode changes

@@ -134,6 +134,17 @@
         );
     };
 
+    function normalizeClusterKey(value) {
+        if (value === null || value === undefined) return "";
+        const raw = String(value).trim();
+        if (!raw) return "";
+        const num = Number.parseFloat(raw);
+        if (!Number.isNaN(num)) {
+            return Number.isInteger(num) ? String(num) : String(num);
+        }
+        return raw;
+    }
+
     function computeSpotOrder(summaries) {
         if (!summaries?.length) return [];
         const first = summaries[0];
@@ -148,7 +159,7 @@
         const set = new Set();
         for (const summary of summaries ?? []) {
             for (const c of summary?.clusters ?? []) {
-                const key = `${c?.cluster ?? ""}`.trim();
+                const key = normalizeClusterKey(c?.cluster);
                 if (key) set.add(key);
             }
         }
@@ -156,10 +167,7 @@
         if (!set.size) {
             for (const summary of summaries ?? []) {
                 for (const s of summary?.spots ?? []) {
-                    const key =
-                        s?.cluster === null || s?.cluster === undefined
-                            ? ""
-                            : `${s.cluster}`.trim();
+                    const key = normalizeClusterKey(s?.cluster);
                     if (key) set.add(key);
                 }
             }
@@ -183,8 +191,7 @@
         for (const s of summary?.spots ?? []) {
             const bc = `${s?.barcode ?? ""}`.trim();
             if (!bc) continue;
-            const c = s?.cluster;
-            const key = c === null || c === undefined ? "" : `${c}`.trim();
+            const key = normalizeClusterKey(s?.cluster);
             map.set(bc, key || null);
         }
         return map;
@@ -192,8 +199,9 @@
 
     function getClusterColor(summary, clusterKey) {
         if (!summary?.clusters || !clusterKey) return null;
+        const normalizedTarget = normalizeClusterKey(clusterKey);
         const found = summary.clusters.find(
-            (c) => `${c?.cluster ?? ""}`.trim() === `${clusterKey}`.trim(),
+            (c) => normalizeClusterKey(c?.cluster) === normalizedTarget,
         );
         return found?.color || null;
     }
@@ -203,13 +211,16 @@
         if (!resultId || !clusterKey) return null;
         const clusterMap = clusterMetricsData.get(resultId);
         if (!clusterMap) return null;
-        const clusterName = `${clusterKey}`.trim();
+        const clusterName = normalizeClusterKey(clusterKey);
         let metrics = clusterMap.get(clusterName);
         if (!metrics) {
             // Try numeric variants
             const num = Number.parseFloat(clusterName);
             if (!Number.isNaN(num)) {
-                metrics = clusterMap.get(num.toFixed(1)) || clusterMap.get(String(num));
+                metrics =
+                    clusterMap.get(num) ||
+                    clusterMap.get(num.toFixed(1)) ||
+                    clusterMap.get(String(num));
             }
         }
         return metrics || null;
@@ -378,8 +389,8 @@
     $: summaries = visibleDistributionSummary ?? [];
     $: spotOrder = computeSpotOrder(summaries);
     $: labelOrder =
-        Array.isArray() && labelOrderOverride.length
-            ? labelOrderOverride
+        Array.isArray(labelOrderOverride) && labelOrderOverride.length
+            ? labelOrderOverride.map((v) => normalizeClusterKey(v)).filter(Boolean)
             : computeLabelOrderFromClusters(summaries);
     $: barcodeMaps = summaries.map((s) => buildBarcodeToClusterMap(s));
 

@@ -139,6 +139,42 @@ def sanitize_float_for_json(value):
         return None
 
 
+def renumber_cluster_labels_start_at_one(labels: List[Any]) -> tuple[List[str], dict]:
+    """
+    将聚类标签重编号为从 1 开始的连续字符串标签。
+    - 若标签可转为数字，按数值顺序编号；
+    - 否则按字符串自然顺序编号。
+    返回 (重编号后的标签列表, 旧->新映射)。
+    """
+    cleaned = []
+    for v in labels:
+        if v is None:
+            cleaned.append("")
+        else:
+            s = str(v).strip()
+            cleaned.append("" if s.lower() == "nan" else s)
+
+    unique_labels = sorted(set(cleaned), key=lambda x: (x == "", x))
+    if not unique_labels:
+        return [], {}
+
+    def _parse_num(x: str):
+        try:
+            return float(x)
+        except Exception:
+            return None
+
+    all_numeric = all(_parse_num(x) is not None for x in unique_labels if x != "")
+    if all_numeric:
+        ordered = sorted(unique_labels, key=lambda x: (_parse_num(x) is None, _parse_num(x), x))
+    else:
+        ordered = sorted(unique_labels, key=lambda x: (x == "", x))
+
+    mapping = {old: str(i + 1) for i, old in enumerate(ordered)}
+    remapped = [mapping.get(v, v) for v in cleaned]
+    return remapped, mapping
+
+
 def set_all_seeds(seed=2020):
     random.seed(seed)
     np.random.seed(seed)
@@ -841,6 +877,12 @@ def compute_clustering_metrics(adata_obj, slice_id: str, cluster_result_id: str)
             raise ValueError("adata 对象为空，无法计算指标。")
         
         adata_local = adata_obj.copy()
+
+        # 以数据库中的最新标签为准（含自动对齐/重编号后的结果），避免指标与当前展示标签错位
+        try:
+            apply_cluster_labels(adata_local, slice_id, cluster_result_id, cluster_field="domain")
+        except Exception as e:
+            print(f"⚠️ 应用最新聚类标签失败，回退使用 adata 当前标签: {e}")
         
         # 获取聚类标签
         if "domain" not in adata_local.obs:
@@ -1177,6 +1219,12 @@ def compute_per_cluster_metrics(adata_obj, slice_id: str, cluster_result_id: str
             raise ValueError("adata 对象为空，无法计算簇级指标。")
         
         adata_local = adata_obj.copy()
+
+        # 以数据库中的最新标签为准（含自动对齐/重编号后的结果），避免簇级指标错位
+        try:
+            apply_cluster_labels(adata_local, slice_id, cluster_result_id, cluster_field="domain")
+        except Exception as e:
+            print(f"⚠️ 应用最新聚类标签失败，回退使用 adata 当前标签: {e}")
         
         # 获取聚类标签
         if "domain" not in adata_local.obs:
@@ -1427,6 +1475,16 @@ def _compute_umap_in_subprocess(emb: np.ndarray, barcodes, timeout: int = 600) -
     return X_umap
 
 
+def _compute_and_store_umap_background(adata_obj, slice_id: str, cluster_result_id: str) -> None:
+    """
+    后台计算并写入 UMAP，避免阻塞 /run-clustering 的主流程。
+    """
+    try:
+        compute_and_store_umap(adata_obj, slice_id, cluster_result_id)
+    except Exception as e:
+        print(f"⚠️ 后台 UMAP 计算失败: {e}")
+
+
 def compute_and_store_umap(adata_obj, slice_id: str, cluster_result_id: str) -> None:
     """
     根据当前聚类结果计算 UMAP，并将坐标写入数据库，供前端后续直接使用。
@@ -1535,6 +1593,14 @@ def run_clustering(request: ClusteringRequest):
         adata_local = run_SpaGCN_and_clustering(adata_local, n_clusters=request.n_clusters, method=request.method, epoch=request.epoch)
     else:
         raise HTTPException(status_code=400, detail=f"❌ 不支持的聚类方法: {request.method}")
+
+    # ✅ 统一簇编号：所有算法输出都重编号为从 1 开始
+    if "domain" in adata_local.obs:
+        remapped_domain, domain_mapping = renumber_cluster_labels_start_at_one(
+            adata_local.obs["domain"].tolist()
+        )
+        adata_local.obs["domain"] = pd.Series(remapped_domain, index=adata_local.obs.index).astype("category")
+        print(f"🔢 簇编号已统一为从 1 开始，映射: {domain_mapping}")
 
     if "emb" not in adata_local.obsm:
         print("⚠️ 未找到通用 embedding，使用 PCA 结果作为替代")
@@ -1693,15 +1759,17 @@ def run_clustering(request: ClusteringRequest):
             )
         print(f"✅ Plot 已保存: {plot_path}")
 
-    # ✅ 预先计算并保存 UMAP 坐标，供后续直接使用
+    # ✅ 后台异步计算并保存 UMAP，避免该步骤阻塞主请求
     try:
-        compute_and_store_umap(
-            adata_local,
-            request.slice_id,
-            request.cluster_result_id,
+        umap_thread = threading.Thread(
+            target=_compute_and_store_umap_background,
+            args=(adata_local.copy(), request.slice_id, request.cluster_result_id),
+            daemon=True,
         )
+        umap_thread.start()
+        print("🚀 UMAP 已转为后台计算（不阻塞当前聚类请求）")
     except Exception as e:
-        print(f"⚠️ 预计算 UMAP 失败: {e}")
+        print(f"⚠️ 启动后台 UMAP 失败: {e}")
     
     # ✅ 计算并保存聚类评估指标
     try:
@@ -1796,6 +1864,32 @@ def run_clustering(request: ClusteringRequest):
                             new_cluster_result_id=None  # 更新当前结果
                         )
                         print(f"✅ 自动对齐完成，准确率: {alignment_result['alignment_accuracy']:.2%}")
+
+                        # 对齐后标签已变化，重新同步到 adata 并重算簇级指标，避免“指标错位”
+                        try:
+                            aligned_labels = fetch_cluster_labels(request.slice_id, request.cluster_result_id)
+                            if aligned_labels:
+                                aligned_series = adata_local.obs_names.to_series().map(aligned_labels)
+                                fallback_domain = adata_local.obs["domain"].astype(str)
+                                adata_local.obs["domain"] = aligned_series.fillna(fallback_domain).astype("category")
+                                # 同步全局 adata，保证后续接口读到的是对齐后标签
+                                adata = adata_local
+
+                                print("🔄 对齐后重算簇级指标...")
+                                aligned_cluster_metrics = compute_per_cluster_metrics(
+                                    adata_local,
+                                    request.slice_id,
+                                    request.cluster_result_id,
+                                )
+                                if aligned_cluster_metrics:
+                                    store_per_cluster_metrics(
+                                        aligned_cluster_metrics,
+                                        request.slice_id,
+                                        request.cluster_result_id,
+                                    )
+                                    print(f"✅ 对齐后簇级指标已更新，共 {len(aligned_cluster_metrics)} 个簇")
+                        except Exception as e:
+                            print(f"⚠️ 对齐后重算簇级指标失败: {e}")
                     except Exception as e:
                         print(f"⚠️ 自动对齐失败: {e}")
                         # 不抛出异常，避免影响聚类结果返回
@@ -6309,6 +6403,12 @@ def apply_label_alignment(
     aligned_labels = {}
     for barcode, source_label in source_labels.items():
         aligned_labels[barcode] = label_mapping.get(source_label, source_label)
+
+    # 对齐后也统一簇编号为从 1 开始，避免出现 0 起始标签
+    aligned_values = [aligned_labels[bc] for bc in sorted(aligned_labels.keys())]
+    remapped_values, remap_mapping = renumber_cluster_labels_start_at_one(aligned_values)
+    for bc, v in zip(sorted(aligned_labels.keys()), remapped_values):
+        aligned_labels[bc] = v
     
     # Save aligned labels
     result_id = new_cluster_result_id or source_cluster_result_id
@@ -6491,6 +6591,7 @@ def apply_label_alignment(
     
     return {
         "label_mapping": label_mapping,
+        "renumber_mapping": remap_mapping,
         "alignment_accuracy": alignment_accuracy,
         "common_barcodes": len(common_barcodes),
         "result_id": result_id,
