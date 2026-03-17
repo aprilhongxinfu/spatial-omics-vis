@@ -10,6 +10,7 @@ dependencies:
   - scipy
   - pandas
   - scikit-learn<1.6.0
+  - scikit-misc
   - matplotlib
   - seaborn
   - networkx

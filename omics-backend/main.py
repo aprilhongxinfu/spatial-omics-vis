@@ -78,6 +78,7 @@ from sklearn.neighbors import kneighbors_graph, NearestNeighbors
 import scanpy as sc
 import ot
 from sklearn.decomposition import PCA
+import cv2
 # rpy2 imports handled above (RPY2_AVAILABLE)
 from dateutil.parser import parse
 # from HVG_explain import interpret_enrichment_with_llm  # Commented out: AI interpretation disabled
@@ -1861,7 +1862,11 @@ def run_SEDR_and_clustering(adata, n_clusters=7, radius=50, method="mclust", ref
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     # model = SEDR.SEDR(adata_local, device=device, epochs=epoch)
     # adata_local = model.train()
-    adata.layers['count'] = adata.X.toarray()
+    # X 可能是 sparse matrix 也可能已经是 numpy.ndarray，这里统一拷贝到 layers['count']
+    if hasattr(adata.X, "toarray"):
+        adata.layers["count"] = adata.X.toarray()
+    else:
+        adata.layers["count"] = np.asarray(adata.X)
     sc.pp.filter_genes(adata, min_cells=50)
     sc.pp.filter_genes(adata, min_counts=10)
     sc.pp.normalize_total(adata, target_sum=1e6)
@@ -1880,18 +1885,31 @@ def run_SEDR_and_clustering(adata, n_clusters=7, radius=50, method="mclust", ref
     else:
         sedr_net.train_without_dec(N=1)
     sedr_feat, _, _, _ = sedr_net.process()
-    adata.obsm['SEDR'] = sedr_feat
-    SEDR.mclust_R(adata, n_clusters, use_rep='SEDR', key_added='SEDR')
-    adata.obs["domain"] = adata.obs["SEDR"].astype(int)
-    adata.obsm['emb'] = sedr_feat
+    adata.obsm["SEDR"] = sedr_feat
+
+    # 原实现调用 SEDR.mclust_R（依赖 rpy2 + R 的 mclust，在 FastAPI 多线程环境里容易报 conversion rules 错误）。
+    # 这里改为完全在 Python 里用 GaussianMixture 做聚类，避免 rpy2 相关问题。
+    from sklearn.mixture import GaussianMixture
+
+    gm = GaussianMixture(n_components=n_clusters, covariance_type="full", random_state=0)
+    labels = gm.fit_predict(sedr_feat)
+
+    adata.obs["domain"] = labels.astype(int)
+    adata.obs["domain"] = adata.obs["domain"].astype("category")
+    adata.obsm["emb"] = sedr_feat
 
     return adata
 
 
-def run_SpaGCN_and_clustering(adata2, n_clusters=7):
+def run_SpaGCN_and_clustering(adata2, n_clusters=7, method="SpaGCN", epoch=500):
     print("⚙️ 执行 SpaGCN 模型训练与聚类...")
 
-    spatial=pd.read_csv("/home/junning/projectnvme/spatial-omics-vis/version1/spatial-omics-vis/omics-backend/data/151673/spatial/tissue_positions_list.csv", header=None,index_col=0) 
+    # SpaGCN 期望 adata.X 是 dense matrix，这里如果是 sparse 就先转成 dense
+    if hasattr(adata2.X, "toarray"):
+        adata2.X = adata2.X.toarray()
+
+    # 使用当前切片对应的数据目录，而不是硬编码路径
+    spatial = pd.read_csv(os.path.join(path, "spatial", "tissue_positions_list.csv"), header=None, index_col=0)
     adata2.obs["x1"]=spatial[1]
     adata2.obs["x2"]=spatial[2]
     adata2.obs["x3"]=spatial[3]
@@ -1902,37 +1920,123 @@ def run_SpaGCN_and_clustering(adata2, n_clusters=7):
     adata2.obs["x_pixel"]=adata2.obs["x4"]
     adata2.obs["y_pixel"]=adata2.obs["x5"]
     #Select captured samples
-    adata2=adata2[adata2.obs["x1"]==1]
+    adata2=adata2[adata2.obs["x1"]==1].copy()
+    coord_cols = ["x_array", "y_array", "x_pixel", "y_pixel"]
+    adata2 = adata2[adata2.obs[coord_cols].notna().all(axis=1)].copy()
+    if adata2.n_obs == 0:
+        raise HTTPException(status_code=400, detail="SpaGCN 无可用 spot：空间坐标为空或与表达矩阵不匹配。")
     adata2.var_names=[i.upper() for i in list(adata2.var_names)]
     adata2.var["genename"]=adata2.var.index.astype("str")
+    # 先清理表达矩阵，避免后续 prefilter / neighbors 因 NaN/Inf 崩溃
+    adata2.X = np.nan_to_num(np.asarray(adata2.X, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    adata2.X = np.clip(adata2.X, a_min=0.0, a_max=None)
+    sc.pp.filter_cells(adata2, min_counts=1)
+    if adata2.n_obs == 0:
+        raise HTTPException(status_code=400, detail="SpaGCN 预处理后无有效 spot（可能全为 0 或无效值）。")
 
-    img=cv2.imread("/home/junning/projectnvme/spatial-omics-vis/version1/spatial-omics-vis/omics-backend/data/151673/spatial/full_image.tif")
-    x_array=adata2.obs["x_array"].tolist()
-    y_array=adata2.obs["y_array"].tolist()
-    x_pixel=adata2.obs["x_pixel"].tolist()
-    y_pixel=adata2.obs["y_pixel"].tolist()
-
+    # 读取组织图像：兼容多种 Visium 命名
+    img_path_candidates = [
+        os.path.join(path, "spatial", "full_image.tif"),
+        os.path.join(path, "spatial", "tissue_hires_image.png"),
+        os.path.join(path, "spatial", "tissue_lowres_image.png"),
+    ]
+    img = None
+    for p in img_path_candidates:
+        if os.path.exists(p):
+            img = cv2.imread(p)
+            if img is not None:
+                print(f"📷 SpaGCN 使用图像: {p}")
+                break
+    if img is None:
+        raise HTTPException(
+            status_code=500,
+            detail=f"SpaGCN 找不到可用的组织图像文件，尝试过: {img_path_candidates}",
+        )
     img_new=img.copy()
-    s=1
-    b=49
-    adj=spg.calculate_adj_matrix(x=x_pixel,y=y_pixel, x_pixel=x_pixel, y_pixel=y_pixel, image=img, beta=b, alpha=s, histology=True)
     spg.prefilter_genes(adata2,min_cells=3) # avoiding all genes are zeros
     spg.prefilter_specialgenes(adata2)
+    sc.pp.filter_cells(adata2, min_counts=1)
+    if adata2.n_obs == 0:
+        raise HTTPException(status_code=400, detail="SpaGCN 过滤后无有效 spot。")
     #Normalize and take log for UMI
     sc.pp.normalize_per_cell(adata2)
     sc.pp.log1p(adata2)
-    p=0.5 
-    l=spg.search_l(p, adj, start=0.01, end=1000, tol=0.001, max_run=100)
-    n_clusters=7
-    r_seed=t_seed=n_seed=100
-    res=spg.search_res(adata2, adj, l, n_clusters, start=0.7, step=0.1, tol=5e-3, lr=0.05, max_epochs=20, r_seed=r_seed, t_seed=t_seed, n_seed=n_seed)
+    adata2.X = np.nan_to_num(np.asarray(adata2.X, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    finite_rows = np.isfinite(adata2.X).all(axis=1)
+    if not np.all(finite_rows):
+        dropped = int((~finite_rows).sum())
+        adata2 = adata2[finite_rows].copy()
+        adata2.X = np.nan_to_num(np.asarray(adata2.X, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        print(f"⚠️ SpaGCN 丢弃 {dropped} 个含 NaN/Inf 的 spot")
+    if adata2.n_obs < 3:
+        raise HTTPException(status_code=400, detail="SpaGCN 有效 spot 数不足（<3），无法稳定聚类。")
 
-    clf=spg.SpaGCN()
+    # 坐标强制转数值，防止字符串/异常值传入 SpaGCN 导致 NaN
+    for c in ["x_array", "y_array", "x_pixel", "y_pixel"]:
+        adata2.obs[c] = pd.to_numeric(adata2.obs[c], errors="coerce")
+    adata2 = adata2[adata2.obs[["x_array", "y_array", "x_pixel", "y_pixel"]].notna().all(axis=1)].copy()
+    if adata2.n_obs < 3:
+        raise HTTPException(status_code=400, detail="SpaGCN 有效 spot 数不足（坐标异常过滤后 <3）。")
+
+    x_array = adata2.obs["x_array"].astype(float).tolist()
+    y_array = adata2.obs["y_array"].astype(float).tolist()
+    x_pixel = adata2.obs["x_pixel"].astype(int).tolist()
+    y_pixel = adata2.obs["y_pixel"].astype(int).tolist()
+    s=1
+    b=49
+    # SpaGCN 官方 histology 路径在某些切片会产生 NaN（图像颜色方差退化），自动降级到 xy-only
+    try:
+        adj = spg.calculate_adj_matrix(
+            x=x_pixel,
+            y=y_pixel,
+            x_pixel=x_pixel,
+            y_pixel=y_pixel,
+            image=img,
+            beta=b,
+            alpha=s,
+            histology=True,
+        )
+    except Exception as e:
+        print(f"⚠️ SpaGCN histology 邻接矩阵失败，降级为 xy-only: {e}")
+        adj = spg.calculate_adj_matrix(x=x_array, y=y_array, histology=False)
+
+    if not np.isfinite(adj).all():
+        print("⚠️ SpaGCN histology 邻接矩阵含 NaN/Inf，降级为 xy-only。")
+        adj = spg.calculate_adj_matrix(x=x_array, y=y_array, histology=False)
+    adj = np.nan_to_num(np.asarray(adj, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+
+    # 该 SpaGCN 版本要求在 train 前显式 set_l，否则会抛错。
+    l = spg.search_l(p=0.5, adj=adj, start=0.01, end=1000, tol=0.01, max_run=100)
+    if l is None:
+        # search_l 在边界条件下可能返回 None，给一个稳定兜底值避免训练直接失败
+        l = 1.0
+        print("⚠️ SpaGCN 未搜索到合适 l，使用兜底值 l=1.0")
+
+    r_seed = t_seed = n_seed = 100
+    res = 0.5  # 合理的中等分辨率，后续如果需要可以再调
+    n_neighbors = max(2, min(10, adata2.n_obs - 1))
+    num_pcs = max(2, min(50, adata2.n_obs - 1, adata2.n_vars - 1))
+    max_epochs = max(20, int(epoch))
+    print(f"⚙️ SpaGCN 使用 kmeans 初始化，max_epochs={max_epochs}")
+
+    clf = spg.SpaGCN()
     clf.set_l(l)
     random.seed(r_seed)
     torch.manual_seed(t_seed)
     np.random.seed(n_seed)
-    result = clf.train(adata2,adj,init_spa=True,init="louvain",res=res, tol=5e-3, lr=0.05, max_epochs=900)
+    clf.train(
+        adata2,
+        adj,
+        num_pcs=num_pcs,
+        n_neighbors=n_neighbors,
+        init_spa=True,
+        init="kmeans",
+        n_clusters=n_clusters,
+        res=res,
+        tol=5e-3,
+        lr=0.05,
+        max_epochs=max_epochs,
+    )
     adata2.obsm["spagcn_embed"] = clf.embed
     adata2.obsm["emb"] = clf.embed
 
@@ -5495,8 +5599,8 @@ def deconvolution_analysis(
         )
 
         reg_model = RegressionModel(adata_sc)
-        # Train with library default device configuration (CPU/GPU auto-handled by scvi-tools).
-        reg_model.train(max_epochs=20)
+        # Train a bit longer to better separate reference cell types
+        reg_model.train(max_epochs=50)
 
         # Export posterior; cell-type signatures are stored in varm
         reg_model.export_posterior(
@@ -5577,12 +5681,14 @@ def deconvolution_analysis(
         c2l_model = Cell2location(
             adata_sp,
             cell_state_df=ref_signatures,
-            N_cells_per_location=30,
+            # Use a smaller expected cell number per spot to avoid overly "averaged"
+            # compositions and to better capture layer-specific structure in DLPFC.
+            N_cells_per_location=10,
             detection_alpha=20,
         )
 
-        # Train with library default device configuration
-        c2l_model.train(max_epochs=50)
+        # Train with more epochs to allow spatial abundances to deviate between spots
+        c2l_model.train(max_epochs=100)
 
         # Export posterior; abundance matrix is stored in obsm
         adata_post = c2l_model.export_posterior(
@@ -5768,6 +5874,8 @@ def deconvolution_analysis(
         # Debug: check proportions
         print(f"📊 Proportions shape: {proportions_arr.shape}")
         print(f"📊 Proportions sum per spot (first 5): {proportions_arr[:5].sum(axis=1)}")
+        print(f"📊 First 5 spots proportions:\n{proportions_arr[:5]}")
+        print(f"📊 Std across spots per cell type: {proportions_arr.std(axis=0)}")
         print(f"📊 Max proportion per cell type: {proportions_arr.max(axis=0)}")
         print(f"📊 Non-zero proportions count: {(proportions_arr > 0.01).sum()}")
         
@@ -6117,13 +6225,39 @@ def align_cluster_labels(
         target_label = target_labels[j]
         label_mapping[source_label] = target_label
     
-    # Handle unmapped source labels (assign to nearest target label or create new)
-    unmapped_source = set(source_labels) - set(label_mapping.keys())
-    for source_label in unmapped_source:
-        # Find target label with maximum overlap
-        source_idx = source_label_to_idx[source_label]
-        best_target_idx = np.argmax(confusion_matrix[source_idx, :])
-        label_mapping[source_label] = target_labels[best_target_idx]
+    # Handle unmapped source labels:
+    # keep them as NEW labels instead of merging into existing target labels.
+    unmapped_source = sorted(set(source_labels) - set(label_mapping.keys()))
+    if unmapped_source:
+        def _to_int_label(label):
+            if isinstance(label, (int, np.integer)):
+                return int(label)
+            s = str(label).strip()
+            if re.fullmatch(r"-?\d+", s):
+                return int(s)
+            return None
+
+        target_ints = [_to_int_label(lbl) for lbl in target_labels]
+        target_has_string = any(isinstance(lbl, str) for lbl in target_labels)
+
+        # If target labels are numeric (or numeric strings), allocate continuous new IDs.
+        if target_ints and all(v is not None for v in target_ints):
+            next_id = max(target_ints) + 1
+            for source_label in unmapped_source:
+                label_mapping[source_label] = str(next_id) if target_has_string else next_id
+                next_id += 1
+        else:
+            # Generic fallback for non-numeric labels, ensure no collision.
+            used_labels = set(target_labels) | set(label_mapping.values())
+            next_idx = 1
+            for source_label in unmapped_source:
+                while True:
+                    candidate = f"new_{next_idx}"
+                    next_idx += 1
+                    if candidate not in used_labels:
+                        used_labels.add(candidate)
+                        label_mapping[source_label] = candidate
+                        break
     
     return label_mapping
 
