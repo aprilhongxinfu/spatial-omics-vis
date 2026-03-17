@@ -486,6 +486,59 @@ let prevClickedInfo = clickedInfo;
         return canvas.toDataURL("image/png");
     }
 
+    function getSpotBounds(data, img) {
+        if (!Array.isArray(data) || !img) return null;
+
+        let minX = Number.POSITIVE_INFINITY;
+        let maxX = Number.NEGATIVE_INFINITY;
+        let minY = Number.POSITIVE_INFINITY;
+        let maxY = Number.NEGATIVE_INFINITY;
+
+        data.forEach((trace) => {
+            const xs = Array.isArray(trace?.x) ? trace.x : [];
+            const ys = Array.isArray(trace?.y) ? trace.y : [];
+            const count = Math.min(xs.length, ys.length);
+
+            for (let i = 0; i < count; i++) {
+                const x = Number(xs[i]);
+                const y = Number(ys[i]);
+                if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+                if (x < minX) minX = x;
+                if (x > maxX) maxX = x;
+                if (y < minY) minY = y;
+                if (y > maxY) maxY = y;
+            }
+        });
+
+        if (
+            !Number.isFinite(minX) ||
+            !Number.isFinite(maxX) ||
+            !Number.isFinite(minY) ||
+            !Number.isFinite(maxY)
+        ) {
+            return null;
+        }
+
+        const spanX = Math.max(1, maxX - minX);
+        const spanY = Math.max(1, maxY - minY);
+        const padX = spanX * 0.03;
+        const padY = spanY * 0.03;
+
+        const boundedMinX = Math.max(0, minX - padX);
+        const boundedMaxX = Math.min(img.width, maxX + padX);
+        const boundedMinY = Math.max(0, minY - padY);
+        const boundedMaxY = Math.min(img.height, maxY + padY);
+
+        if (boundedMinX >= boundedMaxX || boundedMinY >= boundedMaxY) {
+            return null;
+        }
+
+        return {
+            xRange: [boundedMinX, boundedMaxX],
+            yRange: [boundedMinY, boundedMaxY],
+        };
+    }
+
     async function drawPlot() {
         if (plotInstance && spatialDiv) {
             Plotly.purge(spatialDiv);
@@ -512,8 +565,9 @@ let prevClickedInfo = clickedInfo;
         const base64 = toBase64(image);
         
         // 与后端一致：Plotly y 向上，图像底边在 y=0、顶边在 y=image.height，spots 已做 y 翻转
-        const defaultXRange = [0, image.width];
-        const defaultYRange = [0, image.height];
+        const spotBounds = getSpotBounds(spatialData, image);
+        const defaultXRange = spotBounds?.xRange || [0, image.width];
+        const defaultYRange = spotBounds?.yRange || [0, image.height];
         
         const layout = {
             autosize: true,

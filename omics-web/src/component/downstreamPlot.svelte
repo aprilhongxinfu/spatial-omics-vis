@@ -19,6 +19,7 @@
     let currentDragMode = null; // Track current drag mode to restore after redraw
     let colorCache = new Map(); // Cache color lookups to avoid repeated calculations
     let lastColorScaleVersion = -1; // Track color scale version to invalidate cache
+    let plotAspectRatio = "1 / 1";
 
     // Multiple region selection support
     let selectedRegions = []; // Array of { id, barcodes, color }
@@ -43,6 +44,58 @@
         const ctx = canvas.getContext("2d");
         ctx.drawImage(img, 0, 0);
         return canvas.toDataURL("image/png");
+    }
+
+    function getSpotBounds(data, img) {
+        if (!Array.isArray(data) || !img) return null;
+
+        let minX = Number.POSITIVE_INFINITY;
+        let maxX = Number.NEGATIVE_INFINITY;
+        let minY = Number.POSITIVE_INFINITY;
+        let maxY = Number.NEGATIVE_INFINITY;
+
+        data.forEach((trace) => {
+            const xs = Array.isArray(trace?.x) ? trace.x : [];
+            const ys = Array.isArray(trace?.y) ? trace.y : [];
+            const n = Math.min(xs.length, ys.length);
+            for (let i = 0; i < n; i += 1) {
+                const px = Number(xs[i]);
+                const py = Number(ys[i]);
+                if (!Number.isFinite(px) || !Number.isFinite(py)) continue;
+                if (px < minX) minX = px;
+                if (px > maxX) maxX = px;
+                if (py < minY) minY = py;
+                if (py > maxY) maxY = py;
+            }
+        });
+
+        if (
+            !Number.isFinite(minX) ||
+            !Number.isFinite(maxX) ||
+            !Number.isFinite(minY) ||
+            !Number.isFinite(maxY)
+        ) {
+            return null;
+        }
+
+        const spanX = Math.max(1, maxX - minX);
+        const spanY = Math.max(1, maxY - minY);
+        const padX = spanX * 0.03;
+        const padY = spanY * 0.03;
+
+        const boundedMinX = Math.max(0, minX - padX);
+        const boundedMaxX = Math.min(img.width, maxX + padX);
+        const boundedMinY = Math.max(0, minY - padY);
+        const boundedMaxY = Math.min(img.height, maxY + padY);
+
+        if (boundedMinX >= boundedMaxX || boundedMinY >= boundedMaxY) return null;
+
+        return {
+            xRange: [boundedMinX, boundedMaxX],
+            yRange: [boundedMinY, boundedMaxY],
+            xSpan: boundedMaxX - boundedMinX,
+            ySpan: boundedMaxY - boundedMinY,
+        };
     }
 
     function getAllSelectedBarcodes() {
@@ -196,19 +249,28 @@
         });
         
         const base64 = toBase64(image);
+        const spotBounds = getSpotBounds(spatialData, image);
+        if (spotBounds?.xSpan > 0 && spotBounds?.ySpan > 0) {
+            plotAspectRatio = `${spotBounds.xSpan} / ${spotBounds.ySpan}`;
+        } else if (image?.width > 0 && image?.height > 0) {
+            plotAspectRatio = `${image.width} / ${image.height}`;
+        } else {
+            plotAspectRatio = "1 / 1";
+        }
+
         const layout = {
             autosize: true,
             title: "Spatial Clusters",
             uirevision: 'same', // Preserve zoom/pan state across redraws
             xaxis: {
                 visible: false,
-                range: [0, image.width],
+                range: spotBounds?.xRange || [0, image.width],
             },
             // Use the same coordinate orientation as the demo:
             // y 从 0 增加到 image.height，避免上下翻转
             yaxis: {
                 visible: false,
-                range: [0, image.height],
+                range: spotBounds?.yRange || [0, image.height],
                 scaleanchor: "x",
                 scaleratio: 1,
             },
@@ -729,6 +791,17 @@
         // Handle hover from UMAP if needed
     }
 
+    $: {
+        const bounds = getSpotBounds(spatialData, image);
+        if (bounds?.xSpan > 0 && bounds?.ySpan > 0) {
+            plotAspectRatio = `${bounds.xSpan} / ${bounds.ySpan}`;
+        } else if (image?.width > 0 && image?.height > 0) {
+            plotAspectRatio = `${image.width} / ${image.height}`;
+        } else {
+            plotAspectRatio = "1 / 1";
+        }
+    }
+
     let plotInitialized = false;
 
     onMount(() => {
@@ -827,8 +900,12 @@
     });
 </script>
 
-<div class="relative w-full h-full">
-    <div class="h-full" bind:this={spatialDiv}></div>
+<div class="relative w-full h-full flex items-center justify-center">
+    <div
+        class="h-full w-full"
+        style="aspect-ratio: {plotAspectRatio}; max-width: 100%;"
+        bind:this={spatialDiv}
+    ></div>
     
     {#if selectedRegions.length > 0}
         <div class="absolute top-2 left-2 z-10 bg-white/90 backdrop-blur-sm rounded-lg border border-gray-300 shadow-lg p-3 max-w-xs">

@@ -74,6 +74,7 @@
     let spatialPreviewPlotInstance = null;
     // barcode -> { xs: number[], ys: number[] } for highlight trace
     let spatialPreviewBarcodePoints = new Map();
+    let spatialPreviewAspectRatio = "1 / 1";
     let spatialPreviewResizeObserver = null;
     let spatialPreviewEventsBound = false; // Track if events are already bound
     // 防抖：避免短时间内多次调用 drawSpatialPreviewPlot
@@ -108,19 +109,29 @@
         // 保留此函数以兼容现有调用
     }
 
-    /** 根据容器大小、下面是否收缩计算饼图半径（统一逻辑，不区分 showAllPieCharts） */
+    /** 获取空间图 spot 的像素半径（避免受坐标裁剪范围影响） */
+    function getSpatialSpotRadiusPx() {
+        const markerSize = spatialPreviewPlotInstance?.data?.[0]?.marker?.size;
+        if (typeof markerSize === "number" && Number.isFinite(markerSize)) {
+            return Math.max(1, markerSize / 2);
+        }
+        if (Array.isArray(markerSize) && markerSize.length > 0) {
+            const firstFinite = markerSize.find((v) => Number.isFinite(Number(v)));
+            if (firstFinite !== undefined) {
+                return Math.max(1, Number(firstFinite) / 2);
+            }
+        }
+        return 2;
+    }
+
+    /** 根据容器状态计算饼图半径（统一逻辑，不区分 showAllPieCharts） */
     function calculatePieChartRadius() {
         if (!spatialPreviewDiv || !image) return { radius: 2.5, highlightRadius: 2.5 };
-        const rect = spatialPreviewDiv.getBoundingClientRect();
-        const scaleX = rect.width / image.width;
-        const scaleY = rect.height / image.height;
-        const scale = Math.min(scaleX, scaleY);
-        const spotScale = 2.5 * scale * 1.2; // 与 Plotly spot 半径相近的基准
-        const spotSame = spotScale * 0.8;    // 没收缩时用于「普通」饼图，略小于 spot
-        // 统一半径计算：无论 showAllPieCharts 开关如何，饼图大小一致
+        const spotRadius = getSpatialSpotRadiusPx();
+        // 统一半径计算：无论 showAllPieCharts 开关如何，饼图大小一致，且不受裁剪缩放影响
         const baseRadius = isBelowCollapsed
-            ? Math.max(3, Math.min(12, spotScale * 2.5))   // 收缩后明显大
-            : Math.max(1.2, Math.min(3.5, spotSame));     // 没收缩与 spot 一样大
+            ? Math.max(3, Math.min(8, spotRadius * 2.2)) // 收缩后明显大
+            : Math.max(1.4, Math.min(3.2, spotRadius)); // 正常态与 spot 大小接近
         const highlightRadius = baseRadius * 1.5;
         return { radius: baseRadius, highlightRadius };
     }
@@ -130,6 +141,7 @@
 
     // Whether to show the bottom cluster metrics/radar tables (now rendered via MetricsComparison).
     let showClusterTables = true;
+    let hasSpatialCrop = false;
 
     // When the below section collapses/expands (toggled inside LabelResultClusterSpotCircular),
     // force a Plotly redraw so the spatial preview stays aligned and crisp.
@@ -1443,6 +1455,135 @@
         return canvas.toDataURL("image/png");
     }
 
+    function getSpatialPreviewSpotBounds(data, img) {
+        if (!Array.isArray(data) || !img) return null;
+
+        let minX = Number.POSITIVE_INFINITY;
+        let maxX = Number.NEGATIVE_INFINITY;
+        let minY = Number.POSITIVE_INFINITY;
+        let maxY = Number.NEGATIVE_INFINITY;
+
+        data.forEach((trace) => {
+            const xs = Array.isArray(trace?.x) ? trace.x : [];
+            const ys = Array.isArray(trace?.y) ? trace.y : [];
+            const barcodes =
+                Array.isArray(trace?.customdata) && trace.customdata.length === xs.length
+                    ? trace.customdata
+                    : Array.isArray(trace?.text) && trace.text.length === xs.length
+                    ? trace.text
+                    : new Array(xs.length).fill(null);
+
+            const n = Math.min(xs.length, ys.length, barcodes.length);
+            for (let i = 0; i < n; i += 1) {
+                const px = Number(xs[i]);
+                const py = Number(ys[i]);
+                if (!Number.isFinite(px) || !Number.isFinite(py)) continue;
+
+                const bcRaw = barcodes[i];
+                const bc =
+                    bcRaw === null || bcRaw === undefined ? null : `${bcRaw}`.trim() || null;
+                if (
+                    bc &&
+                    barcodeStabilityPercent &&
+                    barcodeStabilityPercent.size > 0 &&
+                    isBarcodeFilteredOutByStability(bc)
+                ) {
+                    continue;
+                }
+
+                if (px < minX) minX = px;
+                if (px > maxX) maxX = px;
+                if (py < minY) minY = py;
+                if (py > maxY) maxY = py;
+            }
+        });
+
+        if (
+            !Number.isFinite(minX) ||
+            !Number.isFinite(maxX) ||
+            !Number.isFinite(minY) ||
+            !Number.isFinite(maxY)
+        ) {
+            return null;
+        }
+
+        const spanX = Math.max(1, maxX - minX);
+        const spanY = Math.max(1, maxY - minY);
+        const padX = spanX * 0.03;
+        const padY = spanY * 0.03;
+
+        const boundedMinX = Math.max(0, minX - padX);
+        const boundedMaxX = Math.min(img.width, maxX + padX);
+        const boundedMinY = Math.max(0, minY - padY);
+        const boundedMaxY = Math.min(img.height, maxY + padY);
+
+        if (boundedMinX >= boundedMaxX || boundedMinY >= boundedMaxY) return null;
+
+        return {
+            xRange: [boundedMinX, boundedMaxX],
+            yRange: [boundedMinY, boundedMaxY],
+            xSpan: boundedMaxX - boundedMinX,
+            ySpan: boundedMaxY - boundedMinY,
+        };
+    }
+
+    function getDefaultSpatialPreviewRanges() {
+        const spotBounds = getSpatialPreviewSpotBounds(spatialData, image);
+        if (spotBounds) return spotBounds;
+        if (!image) return null;
+        return {
+            xRange: [0, image.width],
+            yRange: [0, image.height],
+            xSpan: image.width,
+            ySpan: image.height,
+        };
+    }
+
+    function getCurrentSpatialPreviewRanges() {
+        const xRange = spatialPreviewPlotInstance?.layout?.xaxis?.range;
+        const yRange = spatialPreviewPlotInstance?.layout?.yaxis?.range;
+        if (
+            Array.isArray(xRange) &&
+            xRange.length === 2 &&
+            Array.isArray(yRange) &&
+            yRange.length === 2
+        ) {
+            const xMin = Number(xRange[0]);
+            const xMax = Number(xRange[1]);
+            const yMin = Number(yRange[0]);
+            const yMax = Number(yRange[1]);
+            if (Number.isFinite(xMin) && Number.isFinite(xMax) && Number.isFinite(yMin) && Number.isFinite(yMax) && xMax > xMin && yMax > yMin) {
+                return {
+                    xRange: [xMin, xMax],
+                    yRange: [yMin, yMax],
+                    xSpan: xMax - xMin,
+                    ySpan: yMax - yMin,
+                };
+            }
+        }
+
+        return getDefaultSpatialPreviewRanges();
+    }
+
+    function isSpatialPreviewCropped() {
+        if (!image || image.width <= 0 || image.height <= 0) return false;
+        const current = getCurrentSpatialPreviewRanges();
+        const base = getDefaultSpatialPreviewRanges();
+        if (!current || !base) return false;
+
+        const currentXRatioToImage = current.xSpan / image.width;
+        const currentYRatioToImage = current.ySpan / image.height;
+        const currentXRatioToBase = current.xSpan / base.xSpan;
+        const currentYRatioToBase = current.ySpan / base.ySpan;
+
+        // 两种裁剪都视为“有裁剪”：
+        // 1) 数据层面只显示了图像的一部分（相对全图明显缩小）
+        // 2) 用户在当前预览中进一步缩放到局部区域
+        const dataCropped = currentXRatioToImage < 0.85 || currentYRatioToImage < 0.85;
+        const zoomCropped = currentXRatioToBase < 0.98 || currentYRatioToBase < 0.98;
+        return dataCropped || zoomCropped;
+    }
+
     /** 防抖版本的 drawSpatialPreviewPlot，避免短时间内多次调用导致性能问题 */
     function debouncedDrawSpatialPreviewPlot(delay = 100) {
         if (drawSpatialPreviewTimeout) {
@@ -1463,6 +1604,22 @@
             drawAllPieChartsTimeout = null;
             drawAllPieCharts(highlightBarcode);
         }, delay);
+    }
+
+    $: {
+        const ranges = getCurrentSpatialPreviewRanges();
+        if (ranges && ranges.xSpan > 0 && ranges.ySpan > 0) {
+            spatialPreviewAspectRatio = `${ranges.xSpan} / ${ranges.ySpan}`;
+        } else if (image && image.width > 0 && image.height > 0) {
+            spatialPreviewAspectRatio = `${image.width} / ${image.height}`;
+        } else {
+            spatialPreviewAspectRatio = "1 / 1";
+        }
+    }
+
+    $: {
+        hasSpatialCrop = isSpatialPreviewCropped();
+        showClusterTables = !hasSpatialCrop;
     }
 
     async function drawSpatialPreviewPlot() {
@@ -1491,16 +1648,17 @@
         }
 
         const base64 = toBase64(image);
+        const spotBounds = getSpatialPreviewSpotBounds(spatialData, image);
         // 与主 Plot 一致：Plotly y 向上，图像底边 y=0、顶边 y=image.height，spatialData 已由后端做 y 翻转
         const layout = {
             autosize: true,
             xaxis: {
                 visible: false,
-                range: [0, image.width],
+                range: spotBounds?.xRange || [0, image.width],
             },
             yaxis: {
                 visible: false,
-                range: [0, image.height],
+                range: spotBounds?.yRange || [0, image.height],
                 scaleanchor: "x",
                 scaleratio: 1,
             },
@@ -1827,31 +1985,33 @@
             const rect = spatialPreviewDiv.getBoundingClientRect();
             const width = rect.width;
             const height = rect.height;
-            
-            const imgW = image.width;
-            const imgH = image.height;
+
+            const ranges = getCurrentSpatialPreviewRanges();
+            if (!ranges) return null;
+            const [xMin, xMax] = ranges.xRange;
+            const [yMin, yMax] = ranges.yRange;
+            const xSpan = xMax - xMin;
+            const ySpan = yMax - yMin;
             const canvasAspect = width / height;
-            const imageAspect = imgW / imgH;
-            
+            const dataAspect = xSpan / ySpan;
+
             let scale, offsetX = 0, offsetY = 0;
             
-            if (canvasAspect > imageAspect) {
-                // Canvas is wider, fit by height
-                scale = height / imgH;
-                offsetX = (width - imgW * scale) / 2;
+            if (canvasAspect > dataAspect) {
+                // Container is wider than data box, fit by height
+                scale = height / ySpan;
+                offsetX = (width - xSpan * scale) / 2;
             } else {
-                // Canvas is taller, fit by width
-                scale = width / imgW;
-                offsetY = (height - imgH * scale) / 2;
+                // Container is taller than data box, fit by width
+                scale = width / xSpan;
+                offsetY = (height - ySpan * scale) / 2;
             }
             
             // Convert Plotly coordinates to pixel coordinates
-            // x: Plotly uses [0, imgW], canvas uses [offsetX, offsetX + imgW*scale]
-            const pixelX = offsetX + plotlyX * scale;
+            const pixelX = offsetX + (plotlyX - xMin) * scale;
             
-            // Plotly 使用 y 向上：range [0, imgH]，plotlyY=0 在底部、plotlyY=imgH 在顶部
-            // Canvas：y=0 在顶部，故 pixelY = offsetY + (imgH - plotlyY) * scale
-            const pixelY = offsetY + (imgH - plotlyY) * scale;
+            // Plotly y 向上：yMax 在顶部、yMin 在底部；Canvas y 向下
+            const pixelY = offsetY + (yMax - plotlyY) * scale;
             
             return { x: pixelX, y: pixelY };
         } catch (err) {
@@ -2067,8 +2227,15 @@
     }
     
     // Draw pie charts for all spots, optionally highlighting a specific barcode
-    function drawAllPieCharts(highlightBarcode = null) {
+    function drawAllPieCharts(highlightBarcode = null, retryCount = 0) {
         if (!pieChartCanvas || !spatialPreviewBarcodePoints || !barcodeClusterDistribution) {
+            return;
+        }
+        // First toggle can happen while Plotly is still initializing; retry shortly.
+        if (!spatialPreviewPlotInstance) {
+            if (showAllPieCharts && retryCount < 4) {
+                window.setTimeout(() => drawAllPieCharts(highlightBarcode, retryCount + 1), 80);
+            }
             return;
         }
         
@@ -2155,6 +2322,17 @@
                 ctx.globalAlpha = 1;
             });
         });
+    }
+
+    function handleShowAllPieChartsChange(event) {
+        const nextChecked = Boolean(event?.currentTarget?.checked);
+        if (nextChecked) {
+            tick().then(() => {
+                debouncedDrawAllPieCharts(allPieChartsHighlightBarcode, 0);
+            });
+            return;
+        }
+        allPieChartsHighlightBarcode = null;
     }
 
 
@@ -2267,6 +2445,19 @@
                 ensureTooltipAbovePieCanvas();
             });
         }
+    }
+
+    // If switch is already on, draw once data/points become ready (fix first-toggle race).
+    $: if (
+        showAllPieCharts &&
+        pieChartCanvas &&
+        spatialPreviewPlotInstance &&
+        spatialPreviewBarcodePoints &&
+        spatialPreviewBarcodePoints.size > 0 &&
+        barcodeClusterDistribution &&
+        barcodeClusterDistribution.size > 0
+    ) {
+        debouncedDrawAllPieCharts(allPieChartsHighlightBarcode, 60);
     }
 
     // Redraw all pie charts when spatial preview plot instance changes (if switch is enabled)
@@ -2442,6 +2633,7 @@
                         <input
                             type="checkbox"
                             bind:checked={showAllPieCharts}
+                            on:change={handleShowAllPieChartsChange}
                             class="w-4 h-4 rounded border-slate-300 text-slate-600 focus:ring-2 focus:ring-slate-400 cursor-pointer"
                         />
                     </label>
@@ -2594,7 +2786,7 @@
                 <!-- Spatial preview (slice-level scatter plot) on the right -->
                 <div 
                     class="flex-shrink-0 flex items-center justify-center overflow-hidden relative"
-                    style="height: 100%; aspect-ratio: {image ? `${image.width} / ${image.height}` : '1 / 1'}; max-width: 100%;"
+                    style="height: 100%; aspect-ratio: {spatialPreviewAspectRatio}; max-width: 100%;"
                 >
                     <!-- chartDiv 不设 position: relative，避免创建新 stacking context，这样 hoverlayer 的 z-index 才能超出 -->
                     <div
@@ -2612,7 +2804,7 @@
             </div>
             
             <!-- Circular comparison (replaces MetricsComparison section) -->
-            {#if visibleDistributionSummary?.length > 0}
+            {#if visibleDistributionSummary?.length > 0 && showClusterTables}
                 <LabelResultClusterSpotCircular
                     {visibleDistributionSummary}
                     {selectedResultId}
