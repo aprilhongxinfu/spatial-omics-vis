@@ -1571,17 +1571,13 @@
         const base = getDefaultSpatialPreviewRanges();
         if (!current || !base) return false;
 
-        const currentXRatioToImage = current.xSpan / image.width;
-        const currentYRatioToImage = current.ySpan / image.height;
         const currentXRatioToBase = current.xSpan / base.xSpan;
         const currentYRatioToBase = current.ySpan / base.ySpan;
 
-        // 两种裁剪都视为“有裁剪”：
-        // 1) 数据层面只显示了图像的一部分（相对全图明显缩小）
-        // 2) 用户在当前预览中进一步缩放到局部区域
-        const dataCropped = currentXRatioToImage < 0.85 || currentYRatioToImage < 0.85;
-        const zoomCropped = currentXRatioToBase < 0.98 || currentYRatioToBase < 0.98;
-        return dataCropped || zoomCropped;
+        // 仅在“相对默认范围进一步缩放”时才视为裁剪。
+        // 避免把本来就小于整图的 spot bounds 误判为裁剪（会导致返回页面后表格不显示）。
+        const zoomCropped = currentXRatioToBase < 0.995 || currentYRatioToBase < 0.995;
+        return zoomCropped;
     }
 
     /** 防抖版本的 drawSpatialPreviewPlot，避免短时间内多次调用导致性能问题 */
