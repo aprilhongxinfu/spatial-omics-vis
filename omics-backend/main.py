@@ -1982,11 +1982,85 @@ def run_SEDR_and_clustering(adata, n_clusters=7, radius=50, method="mclust", ref
     adata.obsm["SEDR"] = sedr_feat
 
     # 原实现调用 SEDR.mclust_R（依赖 rpy2 + R 的 mclust，在 FastAPI 多线程环境里容易报 conversion rules 错误）。
-    # 这里改为完全在 Python 里用 GaussianMixture 做聚类，避免 rpy2 相关问题。
+    # 这里改为 Python 端的稳定聚类：
+    # 1) 先做数值稳定化（float64 + finite + 标准化）
+    # 2) GMM 在同 n_clusters 下做多策略回退（不同 covariance_type / reg_covar）
+    # 3) 若 GMM 仍失败，使用同 n_clusters 的 KMeans 兜底（不改变用户设置的簇数）
     from sklearn.mixture import GaussianMixture
+    from sklearn.cluster import KMeans
 
-    gm = GaussianMixture(n_components=n_clusters, covariance_type="full", random_state=0)
-    labels = gm.fit_predict(sedr_feat)
+    feat = np.asarray(sedr_feat, dtype=np.float64)
+    feat = np.nan_to_num(feat, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # 保底检查：样本数必须 >= 簇数
+    n_samples = int(feat.shape[0]) if feat.ndim == 2 else 0
+    if n_samples < int(n_clusters):
+        raise HTTPException(
+            status_code=400,
+            detail=f"SEDR 聚类失败：当前有效 spot 数 ({n_samples}) 小于簇数 ({n_clusters})，无法在保持该簇数下聚类。",
+        )
+
+    # 标准化可以显著降低 GMM 协方差病态概率
+    scaler = StandardScaler()
+    feat_scaled = scaler.fit_transform(feat)
+
+    def _try_gmm(X, k):
+        # 由“严格”到“稳健”逐步回退；保持同一簇数 k
+        configs = [
+            {"covariance_type": "full", "reg_covar": 1e-6, "n_init": 5},
+            {"covariance_type": "full", "reg_covar": 1e-4, "n_init": 5},
+            {"covariance_type": "tied", "reg_covar": 1e-5, "n_init": 5},
+            {"covariance_type": "diag", "reg_covar": 1e-6, "n_init": 5},
+            {"covariance_type": "diag", "reg_covar": 1e-4, "n_init": 8},
+            {"covariance_type": "spherical", "reg_covar": 1e-5, "n_init": 8},
+        ]
+        last_err = None
+        for cfg in configs:
+            try:
+                gm = GaussianMixture(
+                    n_components=int(k),
+                    covariance_type=cfg["covariance_type"],
+                    reg_covar=float(cfg["reg_covar"]),
+                    n_init=int(cfg["n_init"]),
+                    max_iter=500,
+                    init_params="kmeans",
+                    random_state=0,
+                )
+                pred = gm.fit_predict(X)
+                # 结果基本校验
+                if pred is None or len(pred) != X.shape[0]:
+                    raise ValueError("GMM 返回标签长度异常")
+                uniq = np.unique(pred)
+                if uniq.size < 2:
+                    raise ValueError("GMM 聚类塌缩为单簇")
+                print(
+                    f"✅ SEDR-GMM 成功: covariance_type={cfg['covariance_type']}, "
+                    f"reg_covar={cfg['reg_covar']}, n_init={cfg['n_init']}, unique={uniq.size}"
+                )
+                return pred
+            except Exception as e:
+                last_err = e
+                print(
+                    f"⚠️ SEDR-GMM 尝试失败: covariance_type={cfg['covariance_type']}, "
+                    f"reg_covar={cfg['reg_covar']}, n_init={cfg['n_init']} -> {e}"
+                )
+        raise last_err if last_err is not None else RuntimeError("GMM 未知错误")
+
+    labels = None
+    try:
+        labels = _try_gmm(feat_scaled, n_clusters)
+    except Exception as gmm_err:
+        # 对高维共线特征再做一次 PCA 压缩后重试 GMM（仍保持同簇数）
+        try:
+            pca_dim = max(2, min(50, feat_scaled.shape[1], feat_scaled.shape[0] - 1))
+            feat_pca = PCA(n_components=pca_dim, random_state=42).fit_transform(feat_scaled)
+            print(f"⚠️ SEDR-GMM 首轮失败，使用 PCA({pca_dim}) 后重试: {gmm_err}")
+            labels = _try_gmm(feat_pca, n_clusters)
+        except Exception as gmm_pca_err:
+            # 最终兜底：同簇数 KMeans，避免接口 500
+            print(f"⚠️ SEDR-GMM 全部失败，降级到 KMeans（保持 k={n_clusters}）: {gmm_pca_err}")
+            km = KMeans(n_clusters=int(n_clusters), n_init=20, random_state=0)
+            labels = km.fit_predict(feat_scaled)
 
     adata.obs["domain"] = labels.astype(int)
     adata.obs["domain"] = adata.obs["domain"].astype("category")
